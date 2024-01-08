@@ -1,0 +1,1 @@
+1. Medical Cost Personal Dataset named "insurance.csv"
