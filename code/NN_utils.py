@@ -1,10 +1,11 @@
 
 
-import math
+import numpy as np
 import torch
+from torch import nn
 from torch.utils.data import TensorDataset, DataLoader
 from torch.optim import lr_scheduler
-
+from itertools import product
 
 
 
@@ -13,17 +14,14 @@ def convert_to_dataloader(X, Y, to_numpy = False, batch_size = None, shuffle = F
         X = X.to_numpy()
         Y = Y.to_numpy()
     X = torch.from_numpy(X).to(torch.float32)
-    Y = torch.from_numpy(X).to(torch.float32)
+    Y = torch.from_numpy(Y).to(torch.float32)
     if batch_size is None:
         batch_size = len(X)
-    return DataLoader(TensorDataset(X,Y), batch_size = batch_size, shuffle = shuffle)
-
-# Usage example
-#batch_size = X_train.shape[0]
-#batches_per_epoch = int(math.ceil(X_train.shape[0]/batch_size))
-#dataloader_train = convert_to_dataloader(X_train, Y_train, to_numpy = True, batch_size = batch_size)
-#dataloader_val = convert_to_dataloader(X_val, Y_val, to_numpy = True)
-#dataloader_test = convert_to_dataloader(X_test, Y_test, to_numpy = True)
+    dl =  DataLoader(TensorDataset(X,Y), 
+                      batch_size=batch_size, shuffle=shuffle,
+                      num_workers=0,
+                      pin_memory=True)
+    return dl
 
 
 
@@ -46,11 +44,17 @@ def build_scheduler(optimizer, milestones):
 
 
 class Printer(object):
+    """
+    Printing-to-console tool for usage with neural network training.
+    Usage: call update_train/update_eval when you have a new loss value
+    and call step at the end of a batch. Will choose to print when appropriate
+    based on the initialization settings.
+    """
     def __init__(self, window_length = 50, print_every_n_epochs = 100, 
                  batches_per_epoch = 1, running_init = 1):
         self.running_loss_train = running_init
         self.running_loss_eval = running_init
-        self.window_length = window_length
+        self.window_length = window_length # exponential moving average window
         self.print_every = print_every_n_epochs
         self.batch_counter = 0
         self.batches_per_epoch = batches_per_epoch
@@ -85,17 +89,28 @@ class Printer(object):
 
 
 class HyperparameterRecorder():
+    """
+    Take in a dictionary with parameter names as keys and possible settings for
+    it as values in the form of a list. It will iterate through every combination.
+    Usage: Create a while loop using is_complete.  Within, 
+        alternate btw calling next and record to get the current iterations
+        parameter dictionary and recording the performance results of the run.
+        At the end, call get_best to get best parameter settings
+    Note: Designed so that smaller performance/loss is considered better
+    """
     def __init__(self, param_dict, verbose = False):
         self.params = [dict(zip(param_dict.keys(),item)) 
                         for item in product(*param_dict.values())]
         self.n_settings = len(self.params)
         self.counter = 0
         self.needs_record = False
-        self.performances = [-1e8 for _ in range(self.n_settings)]
+        self.performances = [1e8 for _ in range(self.n_settings)]
         self.verbose = verbose
     def next(self):
         if not self.is_complete():
             if not self.needs_record:
+                if self.verbose:
+                    print(f"\nNow trying: {self.params[self.counter]}")
                 self.needs_record = True
                 return self.params[self.counter]
             else:
@@ -110,13 +125,15 @@ class HyperparameterRecorder():
             self.needs_record = False
             self.counter += 1
             if self.verbose:
-                idx = np.argmax(self.performances)
+                idx = np.argmin(self.performances)
+                print(f"Current performance: {np.round(performance,4)}")
                 print(f"Best so far: {np.round(self.performances[idx],4)}, {self.params[idx]}")
         else:
             raise Exception("No associated parameters or result already recorded.")
     def get_best(self):
         if self.is_complete():
-            return self.params[self.best_idx]
+            idx = np.argmin(self.performances)
+            return self.params[idx]
         else:
             raise Exception("Loop incomplete.")
     def get_performances(self):

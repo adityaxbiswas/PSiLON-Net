@@ -1,147 +1,477 @@
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
+from torch import optim
+import lightning as L
+from torch.optim import lr_scheduler
 
 
-    
-class NormLinear(nn.Module):
-    def __init__(self, input_size, output_size, rescale = False, shift = False, type = 'l1'):
+class RMSELoss(nn.Module):
+    def __init__(self):
         super().__init__()
+        self.mse = nn.MSELoss()
+    def forward(self,y,yhat):
+        return torch.sqrt(self.mse(yhat,y))
 
-        # Constrains outgoing weights to a neuron to have l1 or l2 norm of 1
-        if type == 'l1':
-            self.norm_func = self.l1_normalize
-        elif type == 'l2':
-            self.norm_func = self.l2_normalize
-        else:
-            Exception("type can only take values 'l1' or 'l2'")
+class LitNetwork(L.LightningModule):
+    def __init__(self, model, lambda_, compute_loss, compute_eval, total_epochs):
+        super().__init__()
+        self.model = model
+        self.compute_loss = compute_loss
+        self.compute_eval = compute_eval
+        self.lambda_ = lambda_
+        self.total_epochs = total_epochs
 
-        # Allows learnable rescaling g of weights for full expressivity of a linear layer
-        #   - g is learned on the log scale.  must be exponentiated when used
-        # Allows a learned shift term b to be applied after the linear layer (aka 'bias' term)
-        self.rescale = rescale
-        self.shift = shift
-        if rescale:
-            self.g = nn.Parameter(torch.zeros(1,output_size))
-        if shift:
-            self.b = nn.Parameter(torch.zeros(1,output_size))
-
-        # Initializes weight matrix to be an orthogonal matrix, followed by normalization
-        self.weight = torch.empty(input_size, output_size)
-        nn.init.orthogonal_(self.weight)
-        self.weight = nn.Parameter(self.norm_func(self.weight))
-
-    # Normalization function. Note normalization would normally be done along the columns
-    # when writing W*X, but here is instead done along the rows here based on the matrix
-    # multiplication in the forward pass being implemented as X*W
-    def l1_normalize(self, W):
-        norm = torch.sum(torch.abs(W), dim = 0)[None,:]
-        return W/norm
-    def l2_normalize(self, W):
-        norm = (torch.sqrt(torch.sum(W**2, dim = 0))[None,:])
-        return W/norm
-    
     def forward(self, X):
-        W = self.norm_func(self.weight)
-        Z = torch.mm(X,W)
-        if self.rescale:
-            Z *= torch.exp(self.g)
-        if self.shift:
-            Z += self.b
+        return self.model(X)
+    def configure_optimizers(self):
+        optimizer = optim.Adam(self.parameters(),
+                                lr = 1e-2, 
+                                weight_decay = 0)
+        sch = self.build_scheduler(optimizer)
+        return [optimizer], [sch]
+    def training_step(self, train_batch, batch_idx):
+        X, y = train_batch
+        y_hat= self.model(X)
+        loss = self.compute_loss(y_hat[:,0], y)
+        loss_reg = loss + self.lambda_*self.model.compute_reg()
+        self.log('train_loss', loss_reg)
+        return loss_reg
+    def validation_step(self, val_batch, batch_idx):
+        X, y = val_batch
+        y_hat= self.model(X)
+        loss = self.compute_eval(y_hat[:,0], y)
+        self.log('val_loss', loss)
+    def test_step(self, test_batch, batch_idx):
+        X, y = test_batch
+        y_hat= self.model(X)
+        loss = self.compute_eval(y_hat[:,0], y)
+        self.log('test_loss', loss)
+    def build_scheduler(self, optimizer):
+        scheduler1 = lr_scheduler.LinearLR(optimizer, 
+                                        start_factor = 1e-2,
+                                        end_factor = 1, 
+                                        total_iters = 100)
+        scheduler2 = lr_scheduler.LinearLR(optimizer, 
+                                        start_factor = 1,
+                                        end_factor = 1e-2, 
+                                        total_iters = self.total_epochs)
+        scheduler = lr_scheduler.SequentialLR(optimizer, 
+                                            [scheduler1, scheduler2],
+                                            milestones = [250])
+        return scheduler
+
+####################################################################################
+
+class StandardNormLinear(nn.Module):
+    def __init__(self, input_size, output_size, share = False):
+        super().__init__()
+        # Allows learnable rescaling g of weights that is shared across all weight vectors
+        # Allows a learned shift term b to be applied after the linear layer (aka 'bias' term)
+        self.share = share
+        if share:
+            self.g = nn.Parameter(torch.ones(1,1))
+        else:
+            self.g = nn.Parameter(torch.ones(1,output_size))
+        self.bias = nn.Parameter(torch.zeros(1,output_size))
+
+        # Initializes weight matrix to be an orthogonal matrix
+        self.weight = nn.Parameter(torch.empty(input_size, output_size))
+        nn.init.orthogonal_(self.weight)
+
+    # Normalization function. Note normalization would normally be done horizontally
+    # when writing W*X, but here is instead done vertically here based on the matrix
+    # multiplication in the forward pass being implemented as X*W
+    @torch.jit.export
+    def normalize(self, W, b):
+        norm = torch.sum(torch.abs(W), dim = 0)[None,:] 
+        if self.share:
+            norm += torch.abs(b)
+            return self.g*W/norm, self.g*b/norm
+        else:
+            return self.g*W/norm, b
+    def forward(self, X):
+        W, b = self.normalize(self.weight, self.bias)
+        Z = torch.mm(X,W) + b
         return Z
-
-
-class CALLayer2(nn.Module):
-    ''' Concatenated-Activation + Linear Layer'''
-    def __init__(self, input_size, output_size, rescale = False, shift = False, 
-                 type = 'l1', activation = F.relu):
-        super().__init__()
-        self.activation = activation
-        # Doubles the number of incoming features using concatenated activation trick
-        # Uses 'looks linear' initialization
-        self.lineara = NormLinear(input_size, output_size, rescale, False, type)
-        self.linearb = NormLinear(input_size, output_size, rescale, shift, type)
-        with torch.no_grad():
-            self.lineara.weight.copy_(-self.linearb.weight.data)
-    def forward(self, H):
-        return self.lineara(self.activation(H)) + self.linearb(self.activation(-H))
-
-
-
-class CALLayer(nn.Module):
-    ''' Concatenated-Activation + Linear Layer'''
-    def __init__(self, input_size, output_size, rescale = False, shift = False, 
-                 type = 'l1', activation = F.relu):
-        super().__init__()
-        self.activation = activation
-        # Doubles the number of incoming features using concatenated activation trick
-        # Uses 'looks linear' initialization
-        self.linear = NormLinear(2*input_size, output_size, rescale, shift, type)
-        with torch.no_grad():
-            self.linear.weight[input_size:,:].copy_(-self.linear.weight[:input_size,:].data)
-    def forward(self, H):
-        H = torch.cat([self.activation(H), self.activation(-H)], axis = 1)
-        # multiplies output by 2, since when using concatenated activation with relu,
-        # approximately half the neurons are in an off state on average. For NormLinear layers
-        # without scaling, this modification leads to the "effective" norm being about 1
-        return 2*self.linear(H)
     
-class OPLLayer(nn.Module):
-    '''Orthogonal Permutaton Linear Unit + Linear Layer'''
-    def __init__(self, input_size, output_size, rescale = False, shift = False, 
-                 type = 'l1', activation = F.relu):
+class StandardNormBlock(nn.Module):
+    def __init__(self, input_size, output_size, share = False):
         super().__init__()
-        self.linear = NormLinear(input_size, output_size, rescale, shift, type)
-        self.d = int(input_size/2)
-    def forward(self, H):
-        H1, H2 = H[:,:self.d], H[:,self.d:]
-        H_max = torch.maximum(H1, H2)
-        H_min = torch.minimum(H1, H2)
-        H = torch.cat([H_max, H_min], axis = 1)
-        return self.linear(H)
+        self.linear = StandardNormLinear(input_size, output_size, 
+                                         share = share)
+        self.nonlinearity = nn.ReLU()
+    def forward(self, X):
+        return self.linear(self.nonlinearity(X))
     
+##################################################################################
 
-class PathNet(nn.Module):
-    def __init__(self, input_size, hidden_size, output_size, 
-                 n_hidden = 1, use_biases = False, final_type = 'l1', activation = F.relu):
+class CReLU(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.nonlinearity = nn.ReLU()
+    def forward(self, X):
+        return self.nonlinearity(X), -self.nonlinearity(-X)
+
+
+class CReLUNormLinear(nn.Module):
+    def __init__(self, input_size, output_size, share = False, init_zero = False):
+        super().__init__()
+        # Allows learnable rescaling g of weights that is shared across all weight vectors
+        # Allows a learned shift term b to be applied after the linear layer (aka 'bias' term)
+        self.share = share
+        if share:
+            if init_zero:
+                self.g = nn.Parameter(torch.zeros(1,1))
+            else:
+                self.g = nn.Parameter(torch.ones(1,1))
+        else:
+            self.g = nn.Parameter(torch.ones(1,output_size))
+        self.bias = nn.Parameter(torch.zeros(1,output_size))
+
+        # Initializes weight matrix to be an orthogonal matrix
+        self.weight_pos = torch.empty(input_size, output_size)
+        nn.init.orthogonal_(self.weight_pos)
+        self.weight_neg = torch.empty(input_size, output_size)
+        self.weight_neg.copy_(self.weight_pos.data)
+        self.weight_pos = nn.Parameter(self.weight_pos)
+        self.weight_neg = nn.Parameter(self.weight_neg)
+
+    # Normalization function. Note normalization would normally be done horizontally
+    # when writing W*X, but here is instead done vertically here based on the matrix
+    # multiplication in the forward pass being implemented as X*W
+    @torch.jit.export
+    def normalize(self, W_pos, W_neg, b):
+        W_tilde = torch.maximum(torch.abs(W_pos), torch.abs(W_neg))
+        norm = torch.sum(W_tilde, dim = 0)[None,:] 
+        if self.share:
+            norm += torch.abs(b)
+            return self.g*W_pos/norm, self.g*W_neg/norm, self.g*b/norm
+        else:
+            return self.g*W_pos/norm, self.g*W_neg/norm, b
+        
+    def forward(self, X_pos, X_neg):
+        W_pos, W_neg, b = self.normalize(self.weight_pos, self.weight_neg, self.bias)
+        Z = torch.mm(X_pos, W_pos) + torch.mm(X_neg, W_neg) + b
+        return Z
+    
+class ResidualNormBlock(nn.Module):
+    def __init__(self, input_size, output_size, share = False, init_zero = False):
+        super().__init__()
+        self.linear = CReLUNormLinear(input_size, output_size, 
+                                      share = share, init_zero = init_zero)
+        self.activation = CReLU()
+    def forward(self, X):
+        return X + self.linear(*self.activation(X))
+
+##################################################################################
+
+
+class PSiLONNet(nn.Module):
+    def __init__(self, input_size, hidden_size, output_size,  n_hidden = 1):
         super().__init__()
         '''
         General structure is
         1. Embedder: linear map: input_size -> hidden_size
         2. Representer: (n_hidden-1) layers of 
-            (nonlinearity + linear map: hidden_size -> 2*hidden_size -> hidden_size) each
-        3. Predictor 1 final layer of 
-            (nonlinearity + linear map: hidden_size -> 2*hidden_size -> output_size)
+            (nonlinearity + linear map: hidden_size -> hidden_size) each
+            Then, a last nonlinearity: hidden_size -> hidden_size
+        3. Predictor 1 final linear map: hidden_size -> output_size)
             - final nonlinearity is to be applied after usage of this module
         '''
-
         assert n_hidden >= 1
-        self.embedder = NormLinear(input_size, hidden_size, 
-                                   rescale = False, shift = use_biases, type = 'l1')
-        self.representer = [CALLayer(hidden_size, hidden_size,
-                                      rescale = False, shift = use_biases, 
-                                      type = 'l1', activation = activation) \
-                            for i in range(n_hidden-1)]
+        self.n_hidden = n_hidden
+        self.embedder = StandardNormLinear(input_size, hidden_size, share = True)
+        self.representer = [StandardNormBlock(hidden_size, hidden_size, share = True) \
+                            for _ in range(n_hidden-1)]
         self.representer = nn.ModuleList(self.representer)
-        self.predictor = CALLayer(hidden_size, output_size,
-                                  rescale = True, shift = True, 
-                                  type = final_type, activation = activation)
-        
-    def compute_reg(self, lambda_):
+        self.final_nonlinearity = nn.ReLU()
+        self.predictor = StandardNormLinear(hidden_size, output_size, share = False)
+    
+    @torch.jit.export
+    def compute_reg(self):
         # The scale of the weights in the final layer is the only variable we must control
         # to control the 1-Path Norm (and thus a bound on the Lipschitz constant) under default
         # settings.  This is still approx true under other settings
-        #   - g is given on the log scale, so must be exponentiated
-        reg = torch.mean(torch.exp(self.predictor.linear.g)) 
-        return 2*lambda_*reg
+        reg = self.embedder.g[0,0]
+        for module in self.representer:
+            reg = reg*module.linear.g[0,0]
+        reg = torch.abs(reg)*torch.sum(torch.abs(self.predictor.g))
+        return reg
     
+    @torch.jit.export
     def get_representation(self, X):
         Z = self.embedder(X)
         for module in self.representer:
             Z = module(Z)
         return Z
     def forward(self, X):
-        H = self.get_representation(X)
+        H = self.final_nonlinearity(self.get_representation(X))
+        y_preactivation = self.predictor(H)
+        return y_preactivation
+    
+class ResPSiLONNet(nn.Module):
+    def __init__(self, input_size, hidden_size, output_size,  n_hidden = 1):
+        super().__init__()
+        '''
+        General structure is
+        1. Embedder: linear map: input_size -> hidden_size
+        2. Representer: (n_hidden-1) layers of 
+            (nonlinearity + linear map: hidden_size -> 2*hidden_size -> hidden_size) each
+            Then, a last nonlinearity: hidden_size -> 2*hidden_size
+        3. Predictor 1 final linear map: 2*hidden_size -> output_size)
+            - final nonlinearity is to be applied after usage of this module
+        '''
+        assert n_hidden >= 1
+        self.n_hidden = n_hidden
+        self.embedder = StandardNormLinear(input_size, hidden_size, share = True)
+        self.representer = [ResidualNormBlock(hidden_size, hidden_size,
+                                               share = True, init_zero = True) \
+                            for _ in range(n_hidden-1)]
+        self.representer = nn.ModuleList(self.representer)
+        self.final_nonlinearity = CReLU()
+        self.predictor = CReLUNormLinear(hidden_size, output_size, 
+                                            share = False, init_zero = False)
+    
+    @torch.jit.export
+    def compute_reg(self):
+        # The scale of the weights in the final layer is the only variable we must control
+        # to control the 1-Path Norm (and thus a bound on the Lipschitz constant) under default
+        # settings.  This is still approx true under other settings
+        reg = torch.abs(self.embedder.g[0,0])
+        for module in self.representer:
+            reg = reg*(1 + torch.abs(module.linear.g)[0,0])
+        reg = reg*torch.sum(torch.abs(self.predictor.g))
+        return reg
+    
+    @torch.jit.export
+    def get_representation(self, X):
+        Z = self.embedder(X)
+        for module in self.representer:
+            Z = module(Z)
+        return Z
+    def forward(self, X):
+        Z_pos, Z_neg = self.final_nonlinearity(self.get_representation(X))
+        y_preactivation = self.predictor(Z_pos, Z_neg)
+        return y_preactivation
+    
+#####################################################################################
+### Alternative Neural Networks for Comparison
+
+
+class NoShareStandardNormLinear(nn.Module):
+    def __init__(self, input_size, output_size, l2_norm = False):
+        super().__init__()
+        self.l2_norm = l2_norm
+        # Allows learnable rescaling g of weights that is shared across all weight vectors
+        # Allows a learned shift term b to be applied after the linear layer (aka 'bias' term)
+        self.g = nn.Parameter(torch.ones(1,output_size))
+        self.bias = nn.Parameter(torch.zeros(1,output_size))
+
+        # Initializes weight matrix to be an orthogonal matrix
+        self.weight = nn.Parameter(torch.empty(input_size, output_size))
+        nn.init.orthogonal_(self.weight)
+
+    # Normalization function. Note normalization would normally be done horizontally
+    # when writing W*X, but here is instead done vertically here based on the matrix
+    # multiplication in the forward pass being implemented as X*W
+    @torch.jit.export
+    def normalize(self, W):
+        if self.l2_norm:
+            norm = torch.sqrt(torch.sum(W**2, dim = 0))[None,:]
+        else:
+            norm = torch.sum(torch.abs(W), dim = 0)[None,:] 
+        return self.g*W/norm
+    
+    def forward(self, X):
+        W= self.normalize(self.weight)
+        Z = torch.mm(X,W) + self.bias
+        return Z
+    
+class NoShareStandardNormBlock(nn.Module):
+    def __init__(self, input_size, output_size, l2_norm = False):
+        super().__init__()
+        self.linear = NoShareStandardNormLinear(input_size, output_size, l2_norm)
+        self.nonlinearity = nn.ReLU()
+    def forward(self, X):
+        return self.linear(self.nonlinearity(X))
+    
+
+class LONNet(nn.Module):
+    def __init__(self, input_size, hidden_size, output_size,  n_hidden = 1):
+        super().__init__()
+
+        self.input_size = input_size
+        assert n_hidden >= 1
+        self.n_hidden = n_hidden
+        self.embedder = NoShareStandardNormLinear(input_size, hidden_size)
+        self.representer = [NoShareStandardNormBlock(hidden_size, hidden_size) \
+                            for _ in range(n_hidden-1)]
+        self.representer = nn.ModuleList(self.representer)
+        self.final_nonlinearity = nn.ReLU()
+        self.predictor = NoShareStandardNormLinear(hidden_size, output_size)
+
+    @torch.jit.export
+    def reshape_weight(self, W, bias):
+        W = torch.transpose(W,0,1)
+        W = torch.cat([W, torch.transpose(bias,0,1)], dim=1)
+        v = torch.cat([torch.zeros(W.shape[1]-1), torch.ones(1)])[None,:]
+        W = torch.cat([W, v], dim = 0)
+        return W
+    
+    @torch.jit.export
+    def reshape_weight_final(self, W):
+        W = torch.transpose(W,0,1)
+        W = torch.cat([W, torch.zeros(W.shape[0],1)], dim=1)
+        return W
+    
+    @torch.jit.export
+    def normalize(self, g, W):
+        norm = torch.sum(torch.abs(W), dim = 0)[None,:] 
+        return g*W/norm
+
+    @torch.jit.export
+    def compute_reg(self):
+        # The scale of the weights in the final layer is the only variable we must control
+        # to control the 1-Path Norm (and thus a bound on the Lipschitz constant) under default
+        # settings.  This is still approx true under other settings
+        W1 = self.reshape_weight(self.normalize(self.embedder.g,self.embedder.weight), 
+                                 self.embedder.bias)
+        reg = torch.mm(torch.abs(W1), torch.ones(self.input_size+1,1))
+        for module in self.representer:
+            Wi = self.reshape_weight(self.normalize(module.linear.g, module.linear.weight),
+                                     module.linear.bias)
+            reg = torch.mm(torch.abs(Wi),reg)
+        WK = self.reshape_weight_final(self.normalize(self.predictor.g, self.predictor.weight))
+        reg = torch.mm(torch.abs(WK),reg)
+        return torch.sum(reg)
+    
+    @torch.jit.export
+    def get_representation(self, X):
+        Z = self.embedder(X)
+        for module in self.representer:
+            Z = module(Z)
+        return Z
+    def forward(self, X):
+        H = self.final_nonlinearity(self.get_representation(X))
+        y_preactivation = self.predictor(H)
+        return y_preactivation
+    
+
+
+
+class L2NNet(nn.Module):
+    def __init__(self, input_size, hidden_size, output_size,  n_hidden = 1):
+        super().__init__()
+
+        self.input_size = input_size
+        assert n_hidden >= 1
+        self.n_hidden = n_hidden
+        self.embedder = NoShareStandardNormLinear(input_size, hidden_size, l2_norm = True)
+        self.representer = [NoShareStandardNormBlock(hidden_size, hidden_size, l2_norm = True) \
+                            for _ in range(n_hidden-1)]
+        self.representer = nn.ModuleList(self.representer)
+        self.final_nonlinearity = nn.ReLU()
+        self.predictor = NoShareStandardNormLinear(hidden_size, output_size, l2_norm = True)
+
+    @torch.jit.export
+    def reshape_weight(self, W, bias):
+        W = torch.transpose(W,0,1)
+        W = torch.cat([W, torch.transpose(bias,0,1)], dim=1)
+        v = torch.cat([torch.zeros(W.shape[1]-1), torch.ones(1)])[None,:]
+        W = torch.cat([W, v], dim = 0)
+        return W
+    
+    @torch.jit.export
+    def reshape_weight_final(self, W):
+        W = torch.transpose(W,0,1)
+        W = torch.cat([W, torch.zeros(W.shape[0],1)], dim=1)
+        return W
+    
+    @torch.jit.export
+    def normalize(self, g, W):
+        norm = torch.sqrt(torch.sum(W**2, dim = 0))[None,:]
+        return g*W/norm
+
+    @torch.jit.export
+    def compute_reg(self):
+        # The scale of the weights in the final layer is the only variable we must control
+        # to control the 1-Path Norm (and thus a bound on the Lipschitz constant) under default
+        # settings.  This is still approx true under other settings
+        W1 = self.reshape_weight(self.normalize(self.embedder.g,self.embedder.weight), 
+                                 self.embedder.bias)
+        reg = torch.mm(torch.abs(W1), torch.ones(self.input_size+1,1))
+        for module in self.representer:
+            Wi = self.reshape_weight(self.normalize(module.linear.g, module.linear.weight),
+                                     module.linear.bias)
+            reg = torch.mm(torch.abs(Wi),reg)
+        WK = self.reshape_weight_final(self.normalize(self.predictor.g, self.predictor.weight))
+        reg = torch.mm(torch.abs(WK),reg)
+        return torch.sum(reg)
+    
+    @torch.jit.export
+    def get_representation(self, X):
+        Z = self.embedder(X)
+        for module in self.representer:
+            Z = module(Z)
+        return Z
+    def forward(self, X):
+        H = self.final_nonlinearity(self.get_representation(X))
+        y_preactivation = self.predictor(H)
+        return y_preactivation
+    
+
+
+
+
+class StandardNet(nn.Module):
+    def __init__(self, input_size, hidden_size, output_size,  n_hidden = 1):
+        super().__init__()
+
+        self.input_size = input_size
+        assert n_hidden >= 1
+        self.n_hidden = n_hidden
+        self.embedder = NoShareStandardNormLinear(input_size, hidden_size, l2_norm = True)
+        self.representer = [NoShareStandardNormBlock(hidden_size, hidden_size, l2_norm = True) \
+                            for _ in range(n_hidden-1)]
+        self.representer = nn.ModuleList(self.representer)
+        self.final_nonlinearity = nn.ReLU()
+        self.predictor = NoShareStandardNormLinear(hidden_size, output_size, l2_norm = True)
+
+    @torch.jit.export
+    def reshape_weight(self, W, bias):
+        W = torch.transpose(W,0,1)
+        W = torch.cat([W, torch.transpose(bias,0,1)], dim=1)
+        v = torch.cat([torch.zeros(W.shape[1]-1), torch.ones(1)])[None,:]
+        W = torch.cat([W, v], dim = 0)
+        return W
+    
+    @torch.jit.export
+    def normalize(self, g, W):
+        norm = torch.sqrt(torch.sum(W**2, dim = 0))[None,:]
+        return g*W/norm
+
+    @torch.jit.export
+    def compute_reg(self):
+        # The scale of the weights in the final layer is the only variable we must control
+        # to control the 1-Path Norm (and thus a bound on the Lipschitz constant) under default
+        # settings.  This is still approx true under other settings
+        W1 = self.normalize(self.embedder.g, self.embedder.weight)
+        reg = torch.sum(torch.pow(W1,2))
+        for module in self.representer:
+            Wi =  self.normalize(module.linear.g, module.linear.weight)
+            reg = reg + torch.sum(torch.pow(Wi,2))
+        WK = self.normalize(self.predictor.g, self.predictor.weight)
+        reg = reg + torch.sum(torch.pow(WK,2))
+        return torch.sum(reg)
+    
+    @torch.jit.export
+    def get_representation(self, X):
+        Z = self.embedder(X)
+        for module in self.representer:
+            Z = module(Z)
+        return Z
+    def forward(self, X):
+        H = self.final_nonlinearity(self.get_representation(X))
         y_preactivation = self.predictor(H)
         return y_preactivation

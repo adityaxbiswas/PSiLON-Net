@@ -1,6 +1,9 @@
 datasets/
 openml_apikey.txt
-
+results.xlsx
+code/__pycache__/
+code/lightning_logs/
+code/model_checkpoints/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
