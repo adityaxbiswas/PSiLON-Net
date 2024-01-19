@@ -1,9 +1,12 @@
-datasets/
+datasets/*
+!datasets/.gitkeep
 openml_apikey.txt
 results.xlsx
 code/__pycache__/
 code/lightning_logs/
-code/model_checkpoints/
+code/model_checkpoints/*
+!datasets/.gitkeep
+
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
