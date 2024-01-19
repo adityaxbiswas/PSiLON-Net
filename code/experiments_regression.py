@@ -48,6 +48,7 @@ from NeuralNetwork import *
 ### Main neural network training function
 def get_NN_result(Net, compute_loss, compute_eval, dl_train, dl_val, dl_test,
                     epochs, verbose = True, use_es = True, residual = False):
+    # [1e-5,3e-5,1e-4,3e-4,1e-3,3e-3,1e-2]
     recorder = HyperparameterRecorder({'lambda_': [1e-5,3e-5,1e-4,3e-4,1e-3,3e-3,1e-2]}, 
                                     verbose = verbose)
     mc_dict = {}
@@ -147,6 +148,7 @@ psilon_performances = {}
 respsilon_performances = {}
 l1_performances = {}
 l2_performances = {}
+standard_performances = {}
 
 n_keep = 10000
 training_size = 1000
@@ -161,6 +163,7 @@ for task_id in benchmark_suite.tasks:  # iterate over all tasks
     if SUITE_ID == 336:
         if dataset.name in repeat_dataset_names:
             continue
+
     print("Loaded dataset: " + dataset.name)
     X, y, categorical_indicator, feature_names = dataset.get_data(
         dataset_format="dataframe", target=dataset.default_target_attribute
@@ -198,15 +201,15 @@ for task_id in benchmark_suite.tasks:  # iterate over all tasks
 
     compute_loss = nn.MSELoss()
     compute_eval = RMSELoss()
-    epochs = 3000
+    epochs = 2000
     use_es = False # es = early stopping
-    hidden_size = 256
+    hidden_size = 128
     n_hidden = 3
     verbose = False
 
     
     #PSiLONNet
-    '''
+    
     performance = get_NN_result(PSiLONNet, compute_loss, compute_eval,
                                 dl_train, dl_val, dl_test,
                                 epochs, verbose =  verbose, 
@@ -214,7 +217,7 @@ for task_id in benchmark_suite.tasks:  # iterate over all tasks
     psilon_performances[dataset.name] = performance
     print(f"Finished PSiLON Net Experiment: {np.round(performance, 5)}")
     
-
+    '''
     # ResPsiLONNet
     performance = get_NN_result(ResPSiLONNet, compute_loss, compute_eval,
                                 dl_train, dl_val, dl_test,
@@ -224,6 +227,14 @@ for task_id in benchmark_suite.tasks:  # iterate over all tasks
     print(f"Finished ResPSiLON Net Experiment: {np.round(performance, 5)}")
     '''
 
+    # StandardNet
+    performance = get_NN_result(StandardNet, compute_loss, compute_eval,
+                                dl_train, dl_val, dl_test,
+                                epochs, verbose = verbose, 
+                                use_es = use_es, residual = False)
+    standard_performances[dataset.name] = performance
+    print(f"Finished Standard-Net Experiment: {np.round(performance, 5)}")
+
     # LONNet
     performance = get_NN_result(LONNet, compute_loss, compute_eval,
                                 dl_train, dl_val, dl_test,
@@ -232,6 +243,7 @@ for task_id in benchmark_suite.tasks:  # iterate over all tasks
     l1_performances[dataset.name] = performance
     print(f"Finished L1-Net Experiment: {np.round(performance, 5)}")
 
+    
     # L2NNet
     performance = get_NN_result(L2NNet, compute_loss, compute_eval,
                                 dl_train, dl_val, dl_test,
@@ -239,6 +251,7 @@ for task_id in benchmark_suite.tasks:  # iterate over all tasks
                                 use_es = use_es, residual = False)
     l2_performances[dataset.name] = performance
     print(f"Finished L2-Net Experiment: {np.round(performance, 5)}")
+    
 
 
     ######################################################################################
