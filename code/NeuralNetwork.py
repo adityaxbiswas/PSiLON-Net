@@ -14,19 +14,19 @@ class RMSELoss(nn.Module):
         return torch.sqrt(self.mse(yhat,y))
 
 class LitNetwork(L.LightningModule):
-    def __init__(self, model, lambda_, compute_loss, compute_eval, total_epochs):
+    def __init__(self, model, lambda_, compute_loss, compute_eval, total_steps):
         super().__init__()
         self.model = model
         self.compute_loss = compute_loss
         self.compute_eval = compute_eval
         self.lambda_ = lambda_
-        self.total_epochs = total_epochs
+        self.total_steps = total_steps
 
     def forward(self, X):
         return self.model(X)
     def configure_optimizers(self):
         optimizer = optim.Adam(self.parameters(),
-                                lr = 1e-2, 
+                                lr = 2e-3, 
                                 weight_decay = 0)
         sch = self.build_scheduler(optimizer)
         return [optimizer], [sch]
@@ -35,7 +35,7 @@ class LitNetwork(L.LightningModule):
         y_hat= self.model(X)
         loss = self.compute_loss(y_hat[:,0], y)
         loss_reg = loss + self.lambda_*self.model.compute_reg()
-        self.log('train_loss', loss_reg)
+        self.log('train_loss', loss)
         return loss_reg
     def validation_step(self, val_batch, batch_idx):
         X, y = val_batch
@@ -48,17 +48,22 @@ class LitNetwork(L.LightningModule):
         loss = self.compute_eval(y_hat[:,0], y)
         self.log('test_loss', loss)
     def build_scheduler(self, optimizer):
+        k = int(self.total_steps/2)
         scheduler1 = lr_scheduler.LinearLR(optimizer, 
-                                        start_factor = 1e-2,
-                                        end_factor = 1, 
-                                        total_iters = 100)
+                                           start_factor = 1/60,
+                                           end_factor = 1, 
+                                           total_iters = 500)
         scheduler2 = lr_scheduler.LinearLR(optimizer, 
-                                        start_factor = 1,
-                                        end_factor = 1e-2, 
-                                        total_iters = self.total_epochs)
+                                           start_factor = 1,
+                                           end_factor = 1, 
+                                           total_iters = k)
+        scheduler3 = lr_scheduler.LinearLR(optimizer, 
+                                           start_factor = 1,
+                                           end_factor = 1/60,
+                                           total_iters = self.total_steps)
         scheduler = lr_scheduler.SequentialLR(optimizer, 
-                                            [scheduler1, scheduler2],
-                                            milestones = [250])
+                                              [scheduler1, scheduler2, scheduler3],
+                                              milestones = [500,500+k])
         return scheduler
 
 ####################################################################################
@@ -168,7 +173,7 @@ class ResidualNormBlock(nn.Module):
 
 
 class PSiLONNet(nn.Module):
-    def __init__(self, input_size, hidden_size, output_size,  n_hidden = 1):
+    def __init__(self, input_size, hidden_size, output_size,  n_hidden = 1, accelerator = 'cpu'):
         super().__init__()
         '''
         General structure is
@@ -211,7 +216,7 @@ class PSiLONNet(nn.Module):
         return y_preactivation
     
 class ResPSiLONNet(nn.Module):
-    def __init__(self, input_size, hidden_size, output_size,  n_hidden = 1):
+    def __init__(self, input_size, hidden_size, output_size,  n_hidden = 1, accelerator = 'cpu'):
         super().__init__()
         '''
         General structure is
@@ -298,9 +303,9 @@ class NoShareStandardNormBlock(nn.Module):
     
 
 class LONNet(nn.Module):
-    def __init__(self, input_size, hidden_size, output_size,  n_hidden = 1):
+    def __init__(self, input_size, hidden_size, output_size,  n_hidden = 1, accelerator = 'cpu'):
         super().__init__()
-
+        self.accelerator = accelerator
         self.input_size = input_size
         assert n_hidden >= 1
         self.n_hidden = n_hidden
@@ -316,12 +321,17 @@ class LONNet(nn.Module):
         W = torch.transpose(W,0,1)
         W = torch.cat([W, torch.transpose(bias,0,1)], dim=1)
         v = torch.cat([torch.zeros(W.shape[1]-1), torch.ones(1)])[None,:]
+        if self.accelerator == 'gpu':
+            v = v.cuda()
         W = torch.cat([W, v], dim = 0)
         return W
     
     @torch.jit.export
     def reshape_weight_final(self, W):
         W = torch.transpose(W,0,1)
+        v = torch.zeros(W.shape[0],1)
+        if self.accelerator == 'gpu':
+            v = v.cuda()
         W = torch.cat([W, torch.zeros(W.shape[0],1)], dim=1)
         return W
     
@@ -361,9 +371,9 @@ class LONNet(nn.Module):
 
 
 class L2NNet(nn.Module):
-    def __init__(self, input_size, hidden_size, output_size,  n_hidden = 1):
+    def __init__(self, input_size, hidden_size, output_size,  n_hidden = 1, accelerator = 'cpu'):
         super().__init__()
-
+        self.accelerator = accelerator
         self.input_size = input_size
         assert n_hidden >= 1
         self.n_hidden = n_hidden
@@ -379,12 +389,17 @@ class L2NNet(nn.Module):
         W = torch.transpose(W,0,1)
         W = torch.cat([W, torch.transpose(bias,0,1)], dim=1)
         v = torch.cat([torch.zeros(W.shape[1]-1), torch.ones(1)])[None,:]
+        if self.accelerator == 'gpu':
+            v = v.cuda()
         W = torch.cat([W, v], dim = 0)
         return W
     
     @torch.jit.export
     def reshape_weight_final(self, W):
         W = torch.transpose(W,0,1)
+        v = torch.zeros(W.shape[0],1)
+        if self.accelerator == 'gpu':
+            v = v.cuda()
         W = torch.cat([W, torch.zeros(W.shape[0],1)], dim=1)
         return W
     
@@ -425,9 +440,8 @@ class L2NNet(nn.Module):
 
 
 class StandardNet(nn.Module):
-    def __init__(self, input_size, hidden_size, output_size,  n_hidden = 1):
+    def __init__(self, input_size, hidden_size, output_size,  n_hidden = 1, accelerator = 'cpu'):
         super().__init__()
-
         self.input_size = input_size
         assert n_hidden >= 1
         self.n_hidden = n_hidden

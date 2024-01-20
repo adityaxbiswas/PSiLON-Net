@@ -1,21 +1,27 @@
 
+
 import os
 import shutil
 from os import path
-project_folder = path.abspath(path.join(path.sep,"Projects", "PSiLON Net"))
-# clear log and checkpoint folders
+def clear_folder(folder):
+    for root, dirs, files in os.walk(folder):
+        for f in files:
+            os.unlink(os.path.join(root, f))
+        for d in dirs:
+            shutil.rmtree(os.path.join(root, d))
+def create_folder(folder):
+    if not path.exists(folder):
+        os.makedirs(folder)
+
+project_folder = path.abspath(path.join(path.sep,"Projects", "PSiLON-Net"))
+# clear log and checkpoint folders. create if doesnt exist
 lightning_logs_folder = path.join(project_folder, 'code', 'lightning_logs')
 checkpoint_folder = path.join(project_folder, "code", "model_checkpoints")
-for root, dirs, files in os.walk(lightning_logs_folder):
-    for f in files:
-        os.unlink(os.path.join(root, f))
-    for d in dirs:
-        shutil.rmtree(os.path.join(root, d))
-for root, dirs, files in os.walk(checkpoint_folder):
-    for f in files:
-        os.unlink(os.path.join(root, f))
-    for d in dirs:
-        shutil.rmtree(os.path.join(root, d))
+create_folder(lightning_logs_folder)
+create_folder(checkpoint_folder)
+clear_folder(lightning_logs_folder)
+clear_folder(checkpoint_folder)
+
 
 # setup openml
 import openml
@@ -24,6 +30,7 @@ with open(path.join(project_folder, "openml_apikey.txt")) as apikey_file:
 openml.config.apikey = apikey
 openml.config.cache_directory = path.join(project_folder, "datasets")
 
+import math
 import itertools
 import pandas as pd
 import numpy as np
@@ -46,10 +53,12 @@ from NN_utils import HyperparameterRecorder, convert_to_dataloader
 from NeuralNetwork import *
 ###################################################################################
 ### Main neural network training function
-def get_NN_result(Net, compute_loss, compute_eval, dl_train, dl_val, dl_test,
-                    epochs, verbose = True, use_es = True, residual = False):
-    # [1e-5,3e-5,1e-4,3e-4,1e-3,3e-3,1e-2]
-    recorder = HyperparameterRecorder({'lambda_': [1e-5,3e-5,1e-4,3e-4,1e-3,3e-3,1e-2]}, 
+def get_NN_result(Net, compute_loss, compute_eval,
+                   dl_train, dl_val, dl_test,
+                   lambda_list, verbose=True, use_es=True,
+                     residual=False, accelerator="cpu"):
+    # [1e-3,3.3e-3,1e-2,3.3e-2,1e-1]
+    recorder = HyperparameterRecorder({'lambda_': lambda_list}, 
                                     verbose = verbose)
     mc_dict = {}
     while not recorder.is_complete():
@@ -57,11 +66,13 @@ def get_NN_result(Net, compute_loss, compute_eval, dl_train, dl_val, dl_test,
         hyperparams = recorder.next()
         lambda_ = hyperparams['lambda_']
         h = int(hidden_size/2) if residual else hidden_size
-        model = torch.jit.script(Net(X_train.shape[1], h, 1, n_hidden = n_hidden))
+        model = torch.jit.script(Net(X_train.shape[1], h, 1,
+                                      n_hidden = n_hidden,
+                                      accelerator = accelerator))
         litmodel = LitNetwork(model, lambda_=lambda_,
                             compute_loss=compute_loss,
                             compute_eval=compute_eval,
-                            total_epochs = epochs)
+                            total_steps = epochs*n_batches)
         
         # define trainer
         mc_dir = path.join(checkpoint_folder, f"model-reg-{lambda_}")
@@ -74,13 +85,13 @@ def get_NN_result(Net, compute_loss, compute_eval, dl_train, dl_val, dl_test,
             check_val_every_n_epoch = 1
             callbacks = [mc_dict[lambda_], es]
         else:
-            check_val_every_n_epoch = None
+            check_val_every_n_epoch = 20
             callbacks = []
         trainer = L.Trainer(callbacks=callbacks, 
                             max_epochs = epochs,
-                            accelerator='cpu',
+                            accelerator=accelerator,
                             num_sanity_val_steps=0,
-                            log_every_n_steps=1,
+                            log_every_n_steps=10,
                             check_val_every_n_epoch = check_val_every_n_epoch,
                             enable_checkpointing=True,
                             enable_progress_bar=False,
@@ -91,9 +102,12 @@ def get_NN_result(Net, compute_loss, compute_eval, dl_train, dl_val, dl_test,
             trainer.fit(litmodel, dl_train, dl_val)
             performance = mc_dict[lambda_].best_model_score.item()
         else:
-            trainer.fit(litmodel, dl_train)
+            trainer.fit(litmodel, dl_train, dl_val)
             trainer.save_checkpoint(path.join(mc_dir, 'model_final.ckpt'))
             performance = trainer.test(litmodel, dl_val, verbose = False)[0]['test_loss']
+            if verbose:
+                test_performance = trainer.test(litmodel, dl_test, verbose = False)[0]['test_loss']
+                print(f"Test Loss: {np.round(test_performance, 5)}")
         recorder.record(performance)
 
     # load best model and predict on test set
@@ -103,25 +117,23 @@ def get_NN_result(Net, compute_loss, compute_eval, dl_train, dl_val, dl_test,
     if use_es:
         final_model_path = mc_dict[lambda_].best_model_path
     else:
+        mc_dir = path.join(checkpoint_folder, f"model-reg-{lambda_}")
         final_model_path = path.join(mc_dir, 'model_final.ckpt')
     litmodel = LitNetwork.load_from_checkpoint(final_model_path,
                                             model = model,
                                             lambda_=lambda_,
                                             compute_loss=nn.MSELoss(),
                                             compute_eval=RMSELoss(),
-                                            total_epochs = epochs)
+                                            total_steps = epochs*n_batches)
     performance = trainer.test(litmodel, dl_test, verbose = False)[0]['test_loss']
 
-    # clear checkpoint folder
-    for root, dirs, files in os.walk(checkpoint_folder):
-        for f in files:
-            os.unlink(os.path.join(root, f))
-        for d in dirs:
-            shutil.rmtree(os.path.join(root, d))
+    # clear checkpoint and logs folders
+    clear_folder(lightning_logs_folder)
+    clear_folder(checkpoint_folder)
     return performance
 ###################################################################################
 # smaller helper function/tools
-seed = 2353246
+seed = 980679325
 np.random.seed(seed)
 torch.manual_seed(seed)
 torch.cuda.manual_seed(seed)
@@ -145,13 +157,9 @@ repeat_dataset_names = ['delays_zurich_transport', 'diamonds', 'Brazilian_houses
 rf_performances = {}
 lr_performances = {}
 psilon_performances = {}
-respsilon_performances = {}
-l1_performances = {}
-l2_performances = {}
 standard_performances = {}
 
 n_keep = 10000
-training_size = 1000
 SUITE_ID = 335 # Regression on numerical and categorical features
 #SUITE_ID = 336 # Regression on numerical features
 #SUITE_ID = 334 # Classification on numerical and categorical features
@@ -176,7 +184,7 @@ for task_id in benchmark_suite.tasks:  # iterate over all tasks
     X = X.iloc[:n,:]
     y = y.iloc[:n]
     X_train, X_test, y_train, y_test = train_test_split(X, y, 
-                                                        test_size=(n-training_size)/2/n, 
+                                                        test_size=1/4, 
                                                         shuffle=False)
 
     # preprocess the data and split into train/val
@@ -188,75 +196,66 @@ for task_id in benchmark_suite.tasks:  # iterate over all tasks
     y_median, y_qd = y.median(), iqr(y)/2
     y_train = (y_train-y_median)/y_qd
     y_test = (y_test-y_median)/y_qd
-    test_size = (len(X_train)-training_size)/len(X_train)
     X_train, X_val, y_train, y_val = train_test_split(X_train, y_train,
-                                                      test_size=test_size,
+                                                      test_size=1/3,
                                                       shuffle=False)
 
     ################################################################################
     # Neural Network training
-    dl_train = convert_to_dataloader(X_train, y_train.values)
-    dl_val = convert_to_dataloader(X_val, y_val.values)
-    dl_test = convert_to_dataloader(X_test, y_test.values)
 
     compute_loss = nn.MSELoss()
     compute_eval = RMSELoss()
-    epochs = 2000
+    epochs = 1000
     use_es = False # es = early stopping
-    hidden_size = 128
+    hidden_size = 500
     n_hidden = 3
-    verbose = False
+    verbose = True
+    accelerator = 'gpu'
+    n_batches = 10
+    batch_size = int(math.ceil(len(X_train)/10))
+
+    dl_train = convert_to_dataloader(X_train, y_train.values,
+                                     batch_size=batch_size,
+                                     accelerator='cpu')
+    dl_val = convert_to_dataloader(X_val, y_val.values,
+                                     accelerator='cpu')
+    dl_test = convert_to_dataloader(X_test, y_test.values,
+                                     accelerator='cpu')
 
     
     #PSiLONNet
     
+    lambda_list = [1e-4, 2.5e-4, 5e-4,
+                   1e-3, 2.5e-3, 5e-3, 1e-2]
     performance = get_NN_result(PSiLONNet, compute_loss, compute_eval,
                                 dl_train, dl_val, dl_test,
-                                epochs, verbose =  verbose, 
-                                use_es = use_es, residual = False)
+                                lambda_list,
+                                verbose =  verbose, 
+                                use_es = use_es, residual = False,
+                                accelerator = accelerator)
     psilon_performances[dataset.name] = performance
     print(f"Finished PSiLON Net Experiment: {np.round(performance, 5)}")
     
-    '''
-    # ResPsiLONNet
-    performance = get_NN_result(ResPSiLONNet, compute_loss, compute_eval,
-                                dl_train, dl_val, dl_test,
-                                epochs, verbose = verbose, 
-                                use_es = use_es, residual = True)
-    respsilon_performances[dataset.name] = performance
-    print(f"Finished ResPSiLON Net Experiment: {np.round(performance, 5)}")
-    '''
+    
 
     # StandardNet
+    lambda_list = [1e-3, 2.5e-3, 5e-3,
+                   1e-2, 2.5e-2, 5e-2, 1e-1]
     performance = get_NN_result(StandardNet, compute_loss, compute_eval,
                                 dl_train, dl_val, dl_test,
-                                epochs, verbose = verbose, 
-                                use_es = use_es, residual = False)
+                                lambda_list,
+                                verbose = verbose, 
+                                use_es = use_es, residual = False,
+                                accelerator = accelerator)
     standard_performances[dataset.name] = performance
     print(f"Finished Standard-Net Experiment: {np.round(performance, 5)}")
 
-    # LONNet
-    performance = get_NN_result(LONNet, compute_loss, compute_eval,
-                                dl_train, dl_val, dl_test,
-                                epochs, verbose = verbose, 
-                                use_es = use_es, residual = False)
-    l1_performances[dataset.name] = performance
-    print(f"Finished L1-Net Experiment: {np.round(performance, 5)}")
-
-    
-    # L2NNet
-    performance = get_NN_result(L2NNet, compute_loss, compute_eval,
-                                dl_train, dl_val, dl_test,
-                                epochs, verbose = verbose, 
-                                use_es = use_es, residual = False)
-    l2_performances[dataset.name] = performance
-    print(f"Finished L2-Net Experiment: {np.round(performance, 5)}")
-    
 
 
     ######################################################################################
     ### Baseline model training
 
+    '''
     # Ridge Regression
     recorder = HyperparameterRecorder({'alpha': [1e-6,3e-6,1e-5,3e-5,1e-4,3e-4,
                                                  1e-3,3e-3,1e-2,3e-2,1e-1,0.3,1,3,10,30,100]},
@@ -299,4 +298,4 @@ for task_id in benchmark_suite.tasks:  # iterate over all tasks
     performance = RMSE(y_test, y_hat_test)
     rf_performances[dataset.name] = performance
     print(f"Finished Random Forest Experiment: {np.round(performance, 5)}")
-    
+    '''

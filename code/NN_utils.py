@@ -9,18 +9,21 @@ from itertools import product
 
 
 
-def convert_to_dataloader(X, Y, to_numpy = False, batch_size = None, shuffle = False):
+def convert_to_dataloader(X, Y, to_numpy=False, batch_size=None, 
+                          shuffle=False, accelerator='cpu'):
     if to_numpy:
         X = X.to_numpy()
         Y = Y.to_numpy()
     X = torch.from_numpy(X).to(torch.float32)
     Y = torch.from_numpy(Y).to(torch.float32)
+    if accelerator == 'gpu':
+        X = X.to(device='cuda')
+        Y = Y.to(device='cuda')
     if batch_size is None:
         batch_size = len(X)
     dl =  DataLoader(TensorDataset(X,Y), 
                       batch_size=batch_size, shuffle=shuffle,
-                      num_workers=0,
-                      pin_memory=True)
+                      num_workers=0)
     return dl
 
 
