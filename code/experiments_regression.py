@@ -91,7 +91,7 @@ def get_NN_result(Net, compute_loss, compute_eval,
                             max_epochs = epochs,
                             accelerator=accelerator,
                             num_sanity_val_steps=0,
-                            log_every_n_steps=10,
+                            log_every_n_steps=n_batches,
                             check_val_every_n_epoch = check_val_every_n_epoch,
                             enable_checkpointing=True,
                             enable_progress_bar=False,
@@ -159,9 +159,9 @@ lr_performances = {}
 psilon_performances = {}
 standard_performances = {}
 
-n_keep = 10000
-SUITE_ID = 335 # Regression on numerical and categorical features
-#SUITE_ID = 336 # Regression on numerical features
+n_keep = 1000
+#SUITE_ID = 335 # Regression on numerical and categorical features
+SUITE_ID = 336 # Regression on numerical features
 #SUITE_ID = 334 # Classification on numerical and categorical features
 benchmark_suite = openml.study.get_suite(SUITE_ID)  # obtain the benchmark suite
 for task_id in benchmark_suite.tasks:  # iterate over all tasks
@@ -172,10 +172,12 @@ for task_id in benchmark_suite.tasks:  # iterate over all tasks
         if dataset.name in repeat_dataset_names:
             continue
 
-    print("Loaded dataset: " + dataset.name)
     X, y, categorical_indicator, feature_names = dataset.get_data(
         dataset_format="dataframe", target=dataset.default_target_attribute
     )
+    if len(X.columns) < 10:
+        continue
+    print("Loaded dataset: " + dataset.name)
 
     # randomly reduce it in size and train/test split
     n = min(len(y),n_keep)
@@ -184,7 +186,7 @@ for task_id in benchmark_suite.tasks:  # iterate over all tasks
     X = X.iloc[:n,:]
     y = y.iloc[:n]
     X_train, X_test, y_train, y_test = train_test_split(X, y, 
-                                                        test_size=1/4, 
+                                                        test_size=0.4, 
                                                         shuffle=False)
 
     # preprocess the data and split into train/val
@@ -197,7 +199,7 @@ for task_id in benchmark_suite.tasks:  # iterate over all tasks
     y_train = (y_train-y_median)/y_qd
     y_test = (y_test-y_median)/y_qd
     X_train, X_val, y_train, y_val = train_test_split(X_train, y_train,
-                                                      test_size=1/3,
+                                                      test_size=2/3,
                                                       shuffle=False)
 
     ################################################################################
@@ -205,14 +207,14 @@ for task_id in benchmark_suite.tasks:  # iterate over all tasks
 
     compute_loss = nn.MSELoss()
     compute_eval = RMSELoss()
-    epochs = 1000
+    epochs = 2500
     use_es = False # es = early stopping
     hidden_size = 500
     n_hidden = 3
     verbose = True
     accelerator = 'gpu'
-    n_batches = 10
-    batch_size = int(math.ceil(len(X_train)/10))
+    n_batches = 4
+    batch_size = int(math.ceil(len(X_train)/n_batches))
 
     dl_train = convert_to_dataloader(X_train, y_train.values,
                                      batch_size=batch_size,
@@ -224,9 +226,9 @@ for task_id in benchmark_suite.tasks:  # iterate over all tasks
 
     
     #PSiLONNet
-    
-    lambda_list = [1e-4, 2.5e-4, 5e-4,
-                   1e-3, 2.5e-3, 5e-3, 1e-2]
+    # [1e-4, 2.5e-4, 5e-4, 1e-3, 2.5e-3, 5e-3, 1e-2, 2.5e-2]
+    lambda_list = [5e-4, 1e-3, 2.5e-3, 5e-3, 1e-2, 
+                   2.5e-2, 5e-2, 1e-1, 2.5e-1, 5e-1]
     performance = get_NN_result(PSiLONNet, compute_loss, compute_eval,
                                 dl_train, dl_val, dl_test,
                                 lambda_list,
@@ -239,8 +241,8 @@ for task_id in benchmark_suite.tasks:  # iterate over all tasks
     
 
     # StandardNet
-    lambda_list = [1e-3, 2.5e-3, 5e-3,
-                   1e-2, 2.5e-2, 5e-2, 1e-1]
+    lambda_list = [1e-3, 2.5e-3, 5e-3, 1e-2, 
+                   2.5e-2, 5e-2, 1e-1, 2.5e-1]
     performance = get_NN_result(StandardNet, compute_loss, compute_eval,
                                 dl_train, dl_val, dl_test,
                                 lambda_list,
