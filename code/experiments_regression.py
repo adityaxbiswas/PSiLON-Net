@@ -126,11 +126,12 @@ def get_NN_result(Net, compute_loss, compute_eval,
                                             compute_eval=RMSELoss(),
                                             total_steps = epochs*n_batches)
     performance = trainer.test(litmodel, dl_test, verbose = False)[0]['test_loss']
+    nsparsity = litmodel.get_nsparsity()
 
     # clear checkpoint and logs folders
     clear_folder(lightning_logs_folder)
     clear_folder(checkpoint_folder)
-    return performance
+    return performance, nsparsity
 ###################################################################################
 # smaller helper function/tools
 seed = 980679325
@@ -158,8 +159,10 @@ rf_performances = {}
 lr_performances = {}
 psilon_performances = {}
 standard_performances = {}
+psilon_nsparsities = {}
+standard_nsparsities = {}
 
-n_keep = 1000
+n_keep = 10000
 #SUITE_ID = 335 # Regression on numerical and categorical features
 SUITE_ID = 336 # Regression on numerical features
 #SUITE_ID = 334 # Classification on numerical and categorical features
@@ -186,7 +189,7 @@ for task_id in benchmark_suite.tasks:  # iterate over all tasks
     X = X.iloc[:n,:]
     y = y.iloc[:n]
     X_train, X_test, y_train, y_test = train_test_split(X, y, 
-                                                        test_size=0.4, 
+                                                        test_size=0.5, 
                                                         shuffle=False)
 
     # preprocess the data and split into train/val
@@ -199,12 +202,12 @@ for task_id in benchmark_suite.tasks:  # iterate over all tasks
     y_train = (y_train-y_median)/y_qd
     y_test = (y_test-y_median)/y_qd
     X_train, X_val, y_train, y_val = train_test_split(X_train, y_train,
-                                                      test_size=2/3,
+                                                      test_size=0.8,
                                                       shuffle=False)
 
     ################################################################################
     # Neural Network training
-
+    
     compute_loss = nn.MSELoss()
     compute_eval = RMSELoss()
     epochs = 2500
@@ -226,32 +229,33 @@ for task_id in benchmark_suite.tasks:  # iterate over all tasks
 
     
     #PSiLONNet
-    # [1e-4, 2.5e-4, 5e-4, 1e-3, 2.5e-3, 5e-3, 1e-2, 2.5e-2]
-    lambda_list = [5e-4, 1e-3, 2.5e-3, 5e-3, 1e-2, 
-                   2.5e-2, 5e-2, 1e-1, 2.5e-1, 5e-1]
-    performance = get_NN_result(PSiLONNet, compute_loss, compute_eval,
-                                dl_train, dl_val, dl_test,
-                                lambda_list,
-                                verbose =  verbose, 
-                                use_es = use_es, residual = False,
-                                accelerator = accelerator)
+    lambda_list = [1e-4,2.5e-4, 5e-4, 1e-3, 2.5e-3,
+                   5e-3, 1e-2, 2.5e-2, 5e-2,1e-1]
+    performance, nsparsity = get_NN_result(PSiLONNet, compute_loss, compute_eval,
+                                            dl_train, dl_val, dl_test,
+                                            lambda_list,
+                                            verbose =  verbose, 
+                                            use_es = use_es, residual = False,
+                                            accelerator = accelerator)
     psilon_performances[dataset.name] = performance
+    psilon_nsparsities[dataset.name] = nsparsity
     print(f"Finished PSiLON Net Experiment: {np.round(performance, 5)}")
     
     
-
+    
     # StandardNet
-    lambda_list = [1e-3, 2.5e-3, 5e-3, 1e-2, 
-                   2.5e-2, 5e-2, 1e-1, 2.5e-1]
-    performance = get_NN_result(StandardNet, compute_loss, compute_eval,
-                                dl_train, dl_val, dl_test,
-                                lambda_list,
-                                verbose = verbose, 
-                                use_es = use_es, residual = False,
-                                accelerator = accelerator)
+    lambda_list = [1e-4,2.5e-4,5e-4, 1e-3, 2.5e-3, 
+                   5e-3, 1e-2, 2.5e-2, 5e-2, 1e-1]
+    performance, nsparsity = get_NN_result(StandardNet, compute_loss, compute_eval,
+                                            dl_train, dl_val, dl_test,
+                                            lambda_list,
+                                            verbose = verbose, 
+                                            use_es = use_es, residual = False,
+                                            accelerator = accelerator)
     standard_performances[dataset.name] = performance
+    standard_nsparsities[dataset.name] = nsparsity
     print(f"Finished Standard-Net Experiment: {np.round(performance, 5)}")
-
+    
 
 
     ######################################################################################
@@ -277,8 +281,6 @@ for task_id in benchmark_suite.tasks:  # iterate over all tasks
     print(f"Finished Ridge Regression Experiment: {np.round(performance, 5)}")
     
     
-
-
     # Random Forest
     recorder = HyperparameterRecorder({'min_samples_leaf': [4,8,12,16,20,30,
                                                             40,50,75,100,150,200]},

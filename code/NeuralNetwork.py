@@ -50,21 +50,47 @@ class LitNetwork(L.LightningModule):
     def build_scheduler(self, optimizer):
         k = int(self.total_steps/2)
         scheduler1 = lr_scheduler.LinearLR(optimizer, 
-                                           start_factor = 1/60,
+                                           start_factor = 1/20,
                                            end_factor = 1, 
                                            total_iters = 500)
         scheduler2 = lr_scheduler.LinearLR(optimizer, 
                                            start_factor = 1,
                                            end_factor = 1, 
-                                           total_iters = k)
+                                           total_iters = k-500)
         scheduler3 = lr_scheduler.LinearLR(optimizer, 
                                            start_factor = 1,
-                                           end_factor = 1/60,
-                                           total_iters = self.total_steps)
+                                           end_factor = 1/20,
+                                           total_iters = k)
         scheduler = lr_scheduler.SequentialLR(optimizer, 
                                               [scheduler1, scheduler2, scheduler3],
-                                              milestones = [500,500+k])
+                                              milestones = [500,k])
         return scheduler
+    def get_nsparsity(self):
+        ns, l = 0, 0
+        model = self.model
+        with torch.no_grad():
+            ns1, l1 = self.nsparsity(model.embedder.weight.data)
+            ns = ns + ns1
+            l = l + l1
+            for module in model.representer:
+                nsi, li = self.nsparsity(module.linear.weight.data)
+                ns = ns + nsi
+                l = l + li
+            nsK, lK = self.nsparsity(model.predictor.weight.data)
+            ns = ns + nsK
+            l = l + lK
+        return (ns/l).item()
+    
+    def nsparsity(self, W):
+        # returns sum of n_sparsities for each column vector and number of columns
+        d = W.shape[0]
+        pv = torch.abs(W)
+        pv = pv/(torch.sum(pv, dim=0)[None,:])
+        H = torch.sum(-torch.log(pv+1e-8)*pv, dim=0)
+        ns = 1 - torch.exp(H)/d
+        return torch.sum(ns), ns.shape[0]
+        
+
 
 ####################################################################################
 
