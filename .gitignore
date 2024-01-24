@@ -2,8 +2,8 @@ openml_apikey.txt
 results.xlsx
 
 code/__pycache__/
-datasets/*
-!datasets/.gitkeep
+data/*
+!data/.gitkeep
 code/lightning_logs/
 code/model_checkpoints/
 
