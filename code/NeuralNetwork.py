@@ -11,7 +11,7 @@ Nonresidual Feedforward Neural Networks that use Weight Normalization
 
 Important Parameters: share, use_bias, use_l2_wn, use_1pathnorm
 share - Ties length parameter across all nonfinal linear layers
-use_bias - Incorporates bias parameters across all nonfinal linear layers
+use_bias - Incorporates bias parameters across all linear layers
 use_l2_wn - Whether to use L2 weight normalization or the default of L1 WN
 use_1pathnorm - determines which function is called by compute_reg()
                 if false, calls a function to compute sum of L2 norms of weights
@@ -27,9 +27,10 @@ class NormLinear(nn.Module):
         self.share = share
         self.use_bias = use_bias
         self.use_l2_wn = use_l2_wn
-        if use_bias:
-            input_size = input_size + 1
 
+        # create and init parameters bias, g and weight
+        if use_bias:
+            self.bias = nn.Parameter(torch.zeros(1,output_size))
         g_len = 1 if share else output_size
         self.g = nn.Parameter(torch.ones(1,g_len))
         self.weight = nn.Parameter(torch.empty(input_size, output_size))
@@ -40,31 +41,31 @@ class NormLinear(nn.Module):
         self.sparsification_counter = 0
 
     # Normalization functions. Done 'vertically' since forward pass is implemented as X*W
-    def _l1_normalize(self, W):
+    def _l1_normalize(self, W, g):
         norm = torch.sum(torch.abs(W), dim = 0).unsqueeze(0)
-        return self.g*W/norm
-    def _l2_normalize(self, W):
+        return g*W/norm
+    def _l2_normalize(self, W, g):
         norm = torch.sqrt(torch.sum(W**2, dim = 0)).unsqueeze(0)
-        return self.g*W/norm
-    def _l1_project(self, W):
-        S = torch.sign(W)
+        return g*W/norm
+    def _l1_project(self, W, g):
         Y = torch.abs(W)
         U, _ = torch.sort(Y, dim=0, descending=True)
-        k_vals = torch.arange(1, U.shape[0]+1, device=U.device)[:,None]
+        k_vals = torch.arange(1, U.shape[0]+1, device=U.device).unsqueeze(1)
         V = (torch.cumsum(U, dim=0)-1)/k_vals
         idx = torch.sum(V < U, dim=0).long()-1
         tau = V[idx,torch.arange(U.shape[1], device=U.device)].unsqueeze(0)
-        return(self.g*S*F.relu(Y-tau))
+        return(g*torch.sign(W+1e-8)*F.relu(Y-tau))
     
-    def _exact_sparsity(self, W):
+    def _exact_sparsity(self):
         # returns sum of exact sparsities for each column vector and number of columns
         assert self.sparsify
-        W = self._l1_project(W)
+        W = self._l1_project(self.weight, self.g)
         s = torch.sum(W == 0, dim = 0)/W.shape[0]
         return torch.sum(s).item(), s.shape[0]
 
-    def _near_sparsity(self, W):
+    def _near_sparsity(self):
         # returns sum of near sparsities for each column vector and number of columns
+        W = self.weight
         d = W.shape[0]
         pv = torch.abs(W)
         pv = pv/torch.sum(pv, dim=0).unsqueeze(0)
@@ -80,26 +81,26 @@ class NormLinear(nn.Module):
     def get_sparsity(self, near=True):
         with torch.no_grad():
             if near:
-                return self._near_sparsity(self.weight)
+                return self._near_sparsity()
             else:
-                return self._exact_sparsity(self.weight)
+                return self._exact_sparsity()
             
-    def normalize(self, W):
+    def get_normalized_weights(self):
         if self.use_l2_wn:
-            return self._l2_normalize(W)
+            return self._l2_normalize(self.weight, self.g)
         else:
-            return self._l1_normalize(W)
+            return self._l1_normalize(self.weight, self.g)
 
     def forward(self, X):
-        if self.use_bias:
-            X = torch.cat([torch.ones_like(X[:,[0]]), X], dim=1)
-        W = self.normalize(self.weight)
+        W = self.get_normalized_weights()
         if self.sparsify:
-            W_sparse = self._l1_project(self.weight)
+            W_sparse = self._l1_project(self.weight, self.g)
             self.sparsification_counter += 1
             alpha = min(self.sparsification_counter/self.n_sparsification_iters,1)
             W = (1-alpha)*W + alpha*W_sparse
         Z = torch.mm(X,W)
+        if self.use_bias:
+            Z = Z + self.bias
         return Z
     
 class NormBlock(nn.Module):
@@ -124,9 +125,8 @@ class NormNet(nn.Module):
     1. Embedder: linear map: input_size -> hidden_size
     2. Representer: (n_hidden-1) layers of 
         (nonlinearity + linear map: hidden_size -> hidden_size) each
-    3. Apply Nonlinearity
+        Then, a last monlinearity: hidden_size -> hidden_size
     4. Predictor 1 final linear map: hidden_size -> output_size
-        - Add final bias
         - Any output nonlinearity should be applied after usage of this module
     '''
     def __init__(self, input_size, hidden_size, output_size, n_hidden=1, 
@@ -145,39 +145,19 @@ class NormNet(nn.Module):
                             for _ in range(n_hidden-1)]
         self.representer = nn.ModuleList(self.representer)
         self.predictor = NormLinear(hidden_size, output_size, 
-                                    share=False, use_bias=False, 
+                                    share=False, use_bias=True, 
                                     use_l2_wn=use_l2_wn)
-
         self.nonlinearity = nn.ReLU()
-        self.final_bias = nn.Parameter(torch.zeros(1,output_size))
-
-    def _get_formatted_weight(self, W):
-        W = torch.transpose(W,0,1)
-        if self.use_bias:
-            v = torch.zeros_like(W[0,:])
-            v[0] = 1
-            W = torch.cat([v.unsqueeze(0), W], dim = 0)
-        return W
-    
-    def _get_formatted_weight_final(self, W):
-        W = torch.transpose(W,0,1)
-        if self.use_bias:
-            v = torch.zeros_like(W[:,0])
-            W = torch.cat([v.unsqueeze(1), W], dim=1)
-        return W
 
     def _compute_1pathnorm_explicit(self):
         # explicitly compute the 1-path-norm via the matrix product formula
-        W1 = self.embedder.normalize(self.embedder.weight)
-        W1 = self._get_formatted_weight(W1)
-        reg = torch.mm(torch.abs(W1), torch.ones_like(W1[:,0]).unsqueeze(1))
+        W1 = torch.transpose(self.embedder.get_normalized_weights(),0,1)
+        reg = torch.mm(torch.abs(W1), torch.ones_like(W1[0,:]).unsqueeze(1))
         for module in self.representer:
-            Wi = module.linear.normalize(module.linear.weight)
-            Wi = self._get_formatted_weight(Wi)
-            reg = torch.mm(torch.abs(Wi),reg)
-        WK = self.predictor.normalize(self.predictor.weight)
-        WK = self._get_formatted_weight_final(WK)
-        reg = torch.mm(torch.abs(WK),reg)
+            Wi = torch.transpose(module.linear.get_normalized_weights(),0,1)
+            reg = torch.mm(torch.abs(Wi), reg)
+        WK = torch.transpose(self.predictor.get_normalized_weights(),0,1)
+        reg = torch.mm(torch.abs(WK), reg)
         return torch.sum(reg)
     
     def _compute_1pathnorm_simple(self):
@@ -189,17 +169,19 @@ class NormNet(nn.Module):
         return reg
     
     def _compute_l2norm(self):
-        W1 = self.embedder.weight
+        # The usual L2 weight regularization
+        W1 = self.embedder.get_normalized_weights()
         reg = torch.sum(torch.pow(W1,2))
         for module in self.representer:
-            Wi =  module.linear.weight
+            Wi =  module.linear.get_normalized_weights()
             reg = reg + torch.sum(torch.pow(Wi,2))
-        WK = self.predictor.weight
+        WK = self.predictor.get_normalized_weights()
         reg = reg + torch.sum(torch.pow(WK,2))
         return torch.sum(reg)
 
     @torch.jit.export
     def compute_reg(self):
+        # choose which regularization function to use based on settings
         if self.use_1pathnorm:
             if self.use_l2_wn or (not self.share):
                 return self._compute_1pathnorm_explicit()
@@ -236,7 +218,7 @@ class NormNet(nn.Module):
     
     def forward(self, X):
         H = self.get_representation(X)
-        y_preactivation = self.predictor(H) + self.final_bias
+        y_preactivation = self.predictor(H)
         return y_preactivation
 
 ########################################################################################
@@ -268,15 +250,15 @@ class CReLUNormLinear(nn.Module):
         self.share = share
         self.use_bias = use_bias
         self.use_l2_wn = use_l2_wn
-        if use_bias:
-            input_size = input_size + 1
 
+        # create and init parameters bias, g, weight_pos, and weight_neg
+        if use_bias:
+            self.bias = nn.Parameter(torch.zeros(1,output_size))
         g_len = 1 if share else output_size
         if init_zero:
             self.g = nn.Parameter(torch.zeros(1,g_len))
         else:
             self.g = nn.Parameter(torch.ones(1,g_len))
-
         # Initializes pos weight matrix to be an orthogonal matrix
         self.weight_pos = torch.empty(input_size, output_size)
         nn.init.orthogonal_(self.weight_pos)
@@ -291,40 +273,44 @@ class CReLUNormLinear(nn.Module):
         self.sparsification_counter = 0
 
     # Normalization functions. Done "vertically" since forward pass is implemented as X*W
-    def _l1_normalize(self, W_pos, W_neg):
+    def _l1_normalize(self, W_pos, W_neg, g):
         W_tilde = torch.maximum(torch.abs(W_pos), torch.abs(W_neg))
-        norm = torch.sum(W_tilde, dim = 0)[None,:] 
-        return self.g*W_pos/norm, self.g*W_neg/norm
-    def _l2_normalize(self, W_pos, W_neg):
+        norm = torch.sum(W_tilde, dim = 0).unsqueeze(0)
+        return g*W_pos/norm, g*W_neg/norm
+    def _l2_normalize(self, W_pos, W_neg, g):
         W_tilde = torch.maximum(torch.abs(W_pos), torch.abs(W_neg))
         norm = torch.sqrt(torch.sum(W_tilde**2, dim = 0)).unsqueeze(0)
-        return self.g*W_pos/norm, self.g*W_neg/norm
-    def _l1_project(self, W_pos, W_neg):
+        return g*W_pos/norm, g*W_neg/norm
+    def _l1_project(self, W_pos, W_neg, g):
         # get tau using only W_tilde
         W_tilde = torch.maximum(torch.abs(W_pos), torch.abs(W_neg))
         Y = torch.abs(W_tilde)
         U, _ = torch.sort(Y, dim=0, descending=True)
-        k_vals = torch.arange(1, U.shape[0]+1, dtype=U.dtype, device=U.device)[:,None]
+        k_vals = torch.arange(1, U.shape[0]+1, dtype=U.dtype, device=U.device).unsqueeze(1)
         V = (torch.cumsum(U, dim=0)-1)/k_vals
         idx = torch.sum(V < U, dim=0).long()-1
         tau = V[idx,torch.arange(U.shape[1], device=U.device)].unsqueeze(0)
 
         # use tau to project W_pos and W_neg
-        W_pos_project = torch.sign(W_pos)*F.relu(torch.abs(W_pos)-tau)
-        W_neg_project = torch.sign(W_neg)*F.relu(torch.abs(W_neg)-tau)
-        return self.g*W_pos_project, self.g*W_neg_project
+        W_pos_project = torch.sign(W_pos+1e-8)*F.relu(torch.abs(W_pos)-tau)
+        W_neg_project = torch.sign(W_neg+1e-8)*F.relu(torch.abs(W_neg)-tau)
+        return g*W_pos_project, g*W_neg_project
     
-    def _exact_sparsity(self, W_pos, W_neg):
+    def _exact_sparsity(self):
         # returns sum of exact sparsities for each column vector and number of columns
         assert self.sparsify
-        W_pos, W_neg = self._l1_project(W_pos, W_neg)
+        W_pos, W_neg = self._l1_project(self.weight_pos,
+                                        self.weight_neg,
+                                        self.g)
         s_pos = torch.sum(W_pos == 0, dim = 0)/W_pos.shape[0]
         s_neg = torch.sum(W_neg == 0, dim = 0)/W_neg.shape[0]
         s = s_pos + s_neg
         return torch.sum(s).item(), s.shape[0]
 
-    def _near_sparsity(self, W_pos, W_neg):
+    def _near_sparsity(self):
         # returns sum of near sparsities for each column vector and number of columns
+        W_pos = self.weight_pos
+        W_neg = self.weight_neg
         d = W_pos.shape[0]
         pv_pos = torch.abs(W_pos)
         pv_pos = pv_pos/torch.sum(pv_pos, dim=0).unsqueeze(0)
@@ -335,7 +321,7 @@ class CReLUNormLinear(nn.Module):
         s_pos = 1 - torch.exp(H_pos)/d
         s_neg = 1 - torch.exp(H_neg)/d
         s = s_pos + s_neg
-        return torch.sum(s).item(), s.shape[0]
+        return torch.sum(s).item(), 2*s.shape[0]
     
     def init_sparsify(self, n_iters):
         self.sparsify = True
@@ -345,30 +331,30 @@ class CReLUNormLinear(nn.Module):
     def get_sparsity(self, near=True):
         with torch.no_grad():
             if near:
-                return self._near_sparsity(self.weight_pos, self.weight_neg)
+                return self._near_sparsity()
             else:
-                return self._exact_sparsity(self.weight_pos, self.weight_neg)
+                return self._exact_sparsity()
             
-    def normalize(self, W_pos, W_neg):
+    def get_normalized_weights(self):
         if self.use_l2_wn:
-            return self._l2_normalize(W_pos, W_neg)
+            return self._l2_normalize(self.weight_pos, self.weight_neg, self.g)
         else:
-            return self._l1_normalize(W_pos, W_neg)
+            return self._l1_normalize(self.weight_pos, self.weight_neg, self.g)
         
     def forward(self, X_pos, X_neg):
-        if self.use_bias:
-            X_pos = torch.cat([torch.ones_like(X_pos[:,[0]]), X_pos], dim=1)
-            X_neg = torch.cat([torch.zeros_like(X_neg[:,[0]]), X_neg], dim=1)
-
-        W_pos, W_neg = self.normalize(self.weight_pos, self.weight_neg)
+        W_pos, W_neg = self.get_normalized_weights()
         if self.sparsify:
-            W_pos_sparse, W_neg_sparse = self._l1_project(self.weight_pos, self.weight_neg)
+            W_pos_sparse, W_neg_sparse = self._l1_project(self.weight_pos, 
+                                                          self.weight_neg,
+                                                          self.g)
             self.sparsification_counter += 1
             alpha = min(self.sparsification_counter/self.n_sparsification_iters,1)
             W_pos = (1-alpha)*W_pos + alpha*W_pos_sparse
             W_neg = (1-alpha)*W_neg + alpha*W_neg_sparse
 
         Z = torch.mm(X_pos, W_pos) + torch.mm(X_neg, W_neg)
+        if self.use_bias:
+            Z = Z + self.bias
         return Z
 
 class NormResidualBlock(nn.Module):
@@ -419,86 +405,52 @@ class NormResNet(nn.Module):
                             for _ in range(n_hidden-1)]
         self.representer = nn.ModuleList(self.representer)
         self.predictor = CReLUNormLinear(hidden_size, output_size, 
-                                         share=False, use_bias=False, 
+                                         share=False, use_bias=True, 
                                          use_l2_wn=use_l2_wn, init_zero=False)
-        
         self.final_nonlinearity = CReLU()
-        self.final_bias = nn.Parameter(torch.zeros(1,output_size))
 
-    def _get_formatted_weight(self, W_pos, W_neg):
-        W_pos, W_neg = torch.transpose(W_pos,0,1), torch.transpose(W_neg,0,1)
-        if self.use_bias:
-            v = torch.zeros_like(W_pos[0,:])
-            v[0] = 1
-            W_pos = torch.cat([v.unsqueeze(0), W_pos], dim = 0)
-            W_neg = torch.cat([v.unsqueeze(0), W_neg], dim = 0)
-        return W_pos, W_neg
-    
-    def _get_formatted_weight_final(self, W_pos, W_neg):
-        W_pos, W_neg = torch.transpose(W_pos,0,1), torch.transpose(W_neg,0,1)
-        if self.use_bias:
-            v = torch.zeros_like(W_pos[:,0])
-            W_pos = torch.cat([v.unsqueeze(1), W_pos], dim = 1)
-            W_neg = torch.cat([v.unsqueeze(1), W_neg], dim = 1)
-        return W_pos, W_neg
+
 
     def _compute_1pathnorm_explicit(self):
         # explicitly compute the 1-path-norm via the matrix product formula
-        W1 = torch.transpose(self.embedder.normalize(self.embedder.weight), 0, 1)
-        if self.use_bias:
-            v = torch.zeros_like(W1[[0],:])
-            W1 = torch.cat([v, W1], dim = 0)
-        reg = torch.mm(torch.abs(W1), torch.ones_like(W1[:,[0]]))
-
+        W1 = torch.transpose(self.embedder.get_normalized_weights(),0,1)
+        reg = torch.mm(torch.abs(W1), torch.ones_like(W1[0,:]).unsqueeze(1))
         for module in self.representer:
-            Wi_pos, Wi_neg = module.linear.normalize(module.linear.weight_pos, 
-                                                     module.linear.weight_neg)
-            Wi_pos, Wi_neg = self._get_formatted_weight(Wi_pos, Wi_neg)
+            Wi_pos, Wi_neg = module.linear.get_normalized_weights()
+            Wi_pos = torch.transpose(Wi_pos,0,1)
+            Wi_neg = torch.transpose(Wi_neg,0,1)
             I = torch.eye(Wi_pos.shape[0], dtype=Wi_pos.dtype, 
                           layout=Wi_pos.layout, device=Wi_pos.device)
-            I[0,0] = 0
-            # needed matrix looks like | 1  0^T     | most stucture already taken
-            #                          | b  I+W_pos | care of by design and other fxns
             reg = torch.mm(torch.abs(torch.cat([I+Wi_pos,I+Wi_neg], dim=1)), 
                            torch.cat([reg,reg], dim=0))
-
-        WK_pos, WK_neg = self.predictor.normalize(self.predictor.weight_pos, 
-                                                  self.predictor.weight_neg)
-        WK_pos, WK_neg = self._get_formatted_weight_final(WK_pos, WK_neg)
-        I = torch.eye(WK_pos.shape[0], dtype=WK_pos.dtype, 
-                          layout=WK_pos.layout, device=WK_pos.device)
-        I[0,0] = 0
-        reg = reg = torch.mm(torch.abs(torch.cat([I+WK_pos,I+WK_neg], dim=1)),
+        WK_pos, WK_neg = self.predictor.get_normalized_weights()
+        WK_pos = torch.transpose(WK_pos,0,1)
+        WK_neg = torch.transpose(WK_neg,0,1)
+        reg = torch.mm(torch.abs(torch.cat([WK_pos,WK_neg], dim=1)),
                               torch.cat([reg,reg], dim=0))
         return torch.sum(reg)
 
     def _compute_improved_1pathnorm_explicit(self):
         # explicitly compute the 1-path-norm via the matrix product formula using improved formula
-        W1 = torch.transpose(self.embedder.normalize(self.embedder.weight), 0, 1)
-        if self.use_bias:
-            v = torch.zeros_like(W1[[0],:])
-            W1 = torch.cat([v, W1], dim = 0)
-        reg = torch.mm(torch.abs(W1), torch.ones_like(W1[:,[0]]))
+        W1 = torch.transpose(self.embedder.get_normalized_weights(), 0, 1)
+        reg = torch.mm(torch.abs(W1), torch.ones_like(W1[0,:]).unsqueeze(1))
         for module in self.representer:
-            Wi_pos, Wi_neg = module.linear.normalize(module.linear.weight_pos, 
-                                                     module.linear.weight_neg)
-            Wi_pos, Wi_neg = self._get_formatted_weight(Wi_pos, Wi_neg)
+            Wi_pos, Wi_neg = module.linear.get_normalized_weights()
+            Wi_pos = torch.transpose(Wi_pos,0,1)
+            Wi_neg = torch.transpose(Wi_neg,0,1)
             Wi_tilde = torch.maximum(torch.abs(Wi_pos), torch.abs(Wi_neg))
             I = torch.eye(Wi_pos.shape[0], dtype=Wi_pos.dtype, 
                           layout=Wi_pos.layout, device=Wi_pos.device)
-            I[0,0] = 0
             reg = torch.mm(I+Wi_tilde,reg)
-        WK_pos, WK_neg = self.predictor.normalize(self.predictor.weight_pos, 
-                                                  self.predictor.weight_neg)
-        WK_pos, WK_neg = self._get_formatted_weight_final(WK_pos, WK_neg)
+        WK_pos, WK_neg = self.predictor.get_normalized_weights()
+        WK_pos = torch.transpose(WK_pos,0,1)
+        WK_neg = torch.transpose(WK_neg,0,1)
         WK_tilde = torch.maximum(torch.abs(WK_pos), torch.abs(WK_neg))
-        I = torch.eye(WK_pos.shape[0], dtype=WK_pos.dtype, 
-                          layout=WK_pos.layout, device=WK_pos.device)
-        I[0,0] = 0
-        reg = reg = torch.mm(I+WK_tilde,reg)
+        reg = reg = torch.mm(WK_tilde,reg)
         return torch.sum(reg)
     
     def _compute_improved_1pathnorm_simple(self):
+        # use the simplified improved bound formula
         reg = torch.abs(self.embedder.g[0,0])
         for module in self.representer:
             reg = reg*(1 + torch.abs(module.linear.g)[0,0])
@@ -506,17 +458,19 @@ class NormResNet(nn.Module):
         return reg
     
     def _compute_l2norm(self):
-        W1 = self.embedder.weight
+        # the usual l2 weight regularization
+        W1 = self.embedder.get_normalized_weights()
         reg = torch.sum(torch.pow(W1,2))
         for module in self.representer:
-            Wi_pos, Wi_neg =  module.linear.weight_pos, module.linear.weight_neg
+            Wi_pos, Wi_neg =  module.linear.get_normalized_weights()
             reg = reg + torch.sum(torch.pow(Wi_pos,2)) + torch.sum(torch.pow(Wi_neg,2))
-        WK_pos, WK_neg = self.predictor.weight_pos, self.predictor.weight_neg
+        WK_pos, WK_neg = self.predictor.get_normalized_weights()
         reg = reg + torch.sum(torch.pow(WK_pos,2)) + torch.sum(torch.pow(WK_neg,2))
         return torch.sum(reg)
     
     @torch.jit.export
     def compute_reg(self):
+        # choose the appropriate regularization strategy based on the settings
         if self.use_1pathnorm:
             if self.use_improved_1pathnorm:
                 if self.use_l2_wn or (not self.share): # not PSiLON
@@ -555,7 +509,7 @@ class NormResNet(nn.Module):
         return Z_pos, Z_neg 
     def forward(self, X):
         Z_pos, Z_neg = self.get_representation(X)
-        y_preactivation = self.predictor(Z_pos, Z_neg) + self.final_bias
+        y_preactivation = self.predictor(Z_pos, Z_neg)
         return y_preactivation
     
 ############################################################################################

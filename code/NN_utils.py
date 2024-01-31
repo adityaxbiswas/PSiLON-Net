@@ -34,24 +34,28 @@ class RMSELoss(nn.Module):
     def forward(self, y_hat, y):
         return torch.sqrt(self.mse(y_hat,y))
     
-class MulticlassAccuracy():
-    def __init__(self):
+class MulticlassAccuracy(nn.Module):
+    def __init__(self, top_k=1):
         super().__init__()
+        self.top_k = top_k
     def forward(self, y_hat_logits, y):
-        y_hat_class = torch.argmax(y_hat_logits, dim=1)
-        return torch.sum(y_hat_class == y)/y_hat_logits.shape[0]
+        _, y_hat_top_k = torch.topk(y_hat_logits, k=self.top_k, dim=1)
+        matches = torch.any(y_hat_top_k == y.unsqueeze(1), dim = 1)
+        return torch.sum(matches)/y_hat_logits.shape[0]
 
 class LitNetwork(L.LightningModule):
     def __init__(self, model, lambda_, compute_loss, compute_eval,
-                  n_batches, n_epochs, lr):
+                  n_batches, n_epochs, compute_test=None, lr=1e-3, output_size=1):
         super().__init__()
         self.model = model
         self.compute_loss = compute_loss
         self.compute_eval = compute_eval
+        self.compute_test = compute_eval if compute_test is None else compute_test
         self.lambda_ = lambda_
         self.n_batches = n_batches
         self.n_epochs = n_epochs
         self.lr = lr
+        self.output_size = output_size
 
     def forward(self, X):
         return self.model(X)
@@ -63,41 +67,40 @@ class LitNetwork(L.LightningModule):
         return [optimizer], [sch]
     def training_step(self, train_batch, batch_idx):
         X, y = train_batch
-        y_hat= self.model(X)
-        loss = self.compute_loss(y_hat[:,0], y)
+        y_hat = self.model(X)
+        if self.output_size == 1:
+            y_hat = y_hat[:,0]
+        loss = self.compute_loss(y_hat, y)
         loss_reg = loss + self.lambda_*self.model.compute_reg()
-        self.log('train_loss', loss)
+        self.log('train_loss', loss, on_step=False, on_epoch=True)
+        self.log('train_loss_reg', loss_reg, on_step=False, on_epoch=True)
         return loss_reg
     def validation_step(self, val_batch, batch_idx):
         X, y = val_batch
-        y_hat= self.model(X)
-        loss = self.compute_eval(y_hat[:,0], y)
+        y_hat = self.model(X)
+        if self.output_size == 1:
+            y_hat = y_hat[:,0]
+        loss = self.compute_eval(y_hat, y)
+        nsparsity = self.get_sparsity(near=True)
         self.log('val_loss', loss)
+        self.log('near sparsity', nsparsity)
     def test_step(self, test_batch, batch_idx):
         X, y = test_batch
-        y_hat= self.model(X)
-        loss = self.compute_eval(y_hat[:,0], y)
+        y_hat = self.model(X)
+        if self.output_size == 1:
+            y_hat = y_hat[:,0]
+        loss = self.compute_test(y_hat, y)
         self.log('test_loss', loss)
+    def predict_step(self, batch, batch_idx: int, dataloader_idx: int = None):
+        return self(batch)
     def build_scheduler(self, optimizer):
-        total_steps = self.n_batches*self.n_epochs
-        k1 = self.n_batches*100
-        k2 = int(self.n_batches*self.n_epochs/2)
-        # warmup for first n_batches*warmup_epochs
-        scheduler1 = lr_scheduler.LinearLR(optimizer, 
-                                           start_factor = 1/20,
-                                           end_factor = 1, 
-                                           total_iters = k1)
-        scheduler2 = lr_scheduler.LinearLR(optimizer, 
-                                           start_factor = 1,
-                                           end_factor = 1, 
-                                           total_iters = k2-k1)
-        scheduler3 = lr_scheduler.LinearLR(optimizer, 
-                                           start_factor = 1,
-                                           end_factor = 1/20,
-                                           total_iters = k2)
-        scheduler = lr_scheduler.SequentialLR(optimizer, 
-                                              [scheduler1, scheduler2, scheduler3],
-                                              milestones = [k1,k2])
+        factor = self.lr/1e-4
+        scheduler = lr_scheduler.OneCycleLR(optimizer,
+                                            max_lr=self.lr,
+                                            total_steps = self.n_epochs,
+                                            pct_start = 0.2,
+                                            div_factor = factor,
+                                            final_div_factor = factor/10)
         return scheduler
     def get_sparsity(self, near=True):
         return self.model.get_sparsity(near)
@@ -155,7 +158,7 @@ class HyperparameterRecorder():
         return list(zip(self.performances, self.params))
 
 
-# Not used. Switched to using lightning so not needed
+# Not used. Switched to using pytorch lightning so not needed
 class Printer(object):
     """
     Printing-to-console tool for usage with neural network training.
@@ -197,3 +200,4 @@ class Printer(object):
         if self.batch_counter == self.batches_per_epoch:
             self.batch_counter = 0
             self.total_epochs_passed += 1
+

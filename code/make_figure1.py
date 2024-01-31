@@ -46,7 +46,7 @@ for model_name in ['standard', 'standard2', 'psilon']:
                         legend=None)
     axes[ax_dict[identifier]].set(ylim = y_lim_dict[identifier], 
                                   xlim = [0,5000],
-                                  ylabel="Validation RMSE" if identifier == "higgs standard" else None,
+                                  ylabel="Validation Cross-Entropy" if identifier == "higgs standard" else None,
                                   xlabel = "Optimization Step")
     axes[ax_dict[identifier]].yaxis.set_ticks(np.arange(0.6, 1.5, 0.1),
                                               labels = [0.6, '', 0.8, '', 1.0, '', 1.2, '', 1.4])

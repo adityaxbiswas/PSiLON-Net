@@ -21,42 +21,46 @@ create_folder(checkpoint_folder)
 clear_folder(lightning_logs_folder)
 clear_folder(checkpoint_folder)
 
+
 import torchvision
 from torchvision import transforms
 import torch
-from torch.nn import functional as F
 from torch.utils.data import DataLoader
-from lightning.pytorch.callbacks import ModelCheckpoint
-from lightning.pytorch.callbacks.early_stopping import EarlyStopping
+import logging
+logging.getLogger("lightning.pytorch").setLevel(logging.ERROR)
 
 import math
 from NN_utils import *
 from NeuralNetwork import *
 
-def get_NN_result(model, compute_loss, compute_eval,
+# master nn training function
+def get_NN_result(model, compute_loss, compute_eval, compute_test,
                    dl_train, dl_val, dl_test,
                    lambda_list, verbose=True,
-                    compile=True, lr=1e-3):
+                    compile=True, lr=1e-3, output_size=1,
+                    accelerator='cpu'):
     
     recorder = HyperparameterRecorder({'lambda_': lambda_list}, 
                                     verbose = verbose)
-    mc_dict = {}
     while not recorder.is_complete():
-        # create lightning model
         hyperparams = recorder.next()
         lambda_ = hyperparams['lambda_']
+
+        # create lightning model
         if compile:
             model = torch.jit.script(model)
         litmodel = LitNetwork(model, lambda_=lambda_,
                             compute_loss=compute_loss,
                             compute_eval=compute_eval,
+                            compute_test=compute_test,
                             n_batches = n_batches,
                             n_epochs = epochs,
-                            lr=lr)
+                            lr=lr,
+                            output_size=output_size)
         
         # define trainer
         mc_dir = path.join(checkpoint_folder, f"model-reg-{lambda_}")
-        check_val_every_n_epoch = 1
+        check_val_every_n_epoch = 40
         trainer = L.Trainer(callbacks=[], 
                             max_epochs = epochs,
                             accelerator=accelerator,
@@ -67,13 +71,13 @@ def get_NN_result(model, compute_loss, compute_eval,
                             enable_progress_bar=False,
                             enable_model_summary=False)
         
-        # train, predict on val, and record
+        # train, save model, predict, and record
         trainer.fit(litmodel, dl_train, dl_val)
         trainer.save_checkpoint(path.join(mc_dir, 'model_final.ckpt'))
-        performance = trainer.test(litmodel, dl_val, verbose = False)[0]['test_loss']
+        performance = trainer.validate(litmodel, dl_val, verbose = False)[0]['val_loss']
         if verbose:
             test_performance = trainer.test(litmodel, dl_test, verbose = False)[0]['test_loss']
-            print(f"Test Loss: {np.round(test_performance, 5)}")
+            print(f"Test Accuracy: {np.round(test_performance, 5)}")
         recorder.record(performance)
 
     # load best model and predict on test set
@@ -87,22 +91,27 @@ def get_NN_result(model, compute_loss, compute_eval,
                                             lambda_=lambda_,
                                             compute_loss=compute_loss,
                                             compute_eval=compute_eval,
+                                            compute_test=compute_test,
                                             n_batches = n_batches,
-                                            n_epochs = epochs)
+                                            n_epochs = epochs,
+                                            lr=lr,
+                                            output_size=output_size)
     performance = trainer.test(litmodel, dl_test, verbose = False)[0]['test_loss']
+    cross_entropy = trainer.validate(litmodel, dl_test, verbose = False)[0]['val_loss']
     nsparsity = litmodel.get_sparsity(near=True)
 
-    # clear checkpoint and logs folders
-    #clear_folder(lightning_logs_folder)
-    #clear_folder(checkpoint_folder)
-    return performance, nsparsity
+    return performance, cross_entropy, nsparsity
 
-project_folder = path.abspath(path.join(path.sep,"Projects", "PSiLON-Net"))
+
+##########################################################################################
+
+# load and preprocess all data
+input_transform = transforms.Compose([
+    transforms.ToTensor(),
+    transforms.Normalize((0.5,), (0.5,)),
+    torch.nn.Flatten(0)
+])
 data_folder = path.join(project_folder, "data", "fashion")
-
-input_transform = transforms.Compose(
-    [transforms.ToTensor(),
-    transforms.Normalize((0.5,), (0.5,))])
 data_train = torchvision.datasets.FashionMNIST(data_folder,
                                                train=True,
                                                download=True,
@@ -111,43 +120,164 @@ data_test = torchvision.datasets.FashionMNIST(data_folder,
                                               train=False,
                                               download=True,
                                               transform=input_transform)
-data_train, data_val = torch.utils.data.random_split(data_train, [50000, 10000])
+
+# randomly subset into train/val
+data_train, data_val = torch.utils.data.random_split(data_train, [40000, 20000])
+n_keep_train = 10000
+data_train, _ = torch.utils.data.random_split(data_train, [n_keep_train, 
+                                                           40000-n_keep_train])
 
 
-
-batch_size = 100
-n_batches = int(math.ceil(50000/batch_size))
-train_loader = DataLoader(data_train, batch_size=100, shuffle=True,
+# create data loaders
+batch_size = 200
+n_batches = int(math.ceil(n_keep_train/batch_size))
+dl_train = DataLoader(data_train, batch_size=batch_size, shuffle=True,
                          num_workers=0, pin_memory=True)
-val_loader = DataLoader(data_val, batch_size=500,
+dl_val = DataLoader(data_val, batch_size=500,
                          num_workers=0, pin_memory=True)
-test_loader = DataLoader(data_test, batch_size=500,
+dl_test = DataLoader(data_test, batch_size=500,
                          num_workers=0)
 
 
+# model seettings
 compute_loss = nn.CrossEntropyLoss()
-compute_eval = MulticlassAccuracy()
-epochs = 100
+compute_eval = nn.CrossEntropyLoss()
+compute_test = MulticlassAccuracy(top_k=1)
+epochs = 400
 input_size = 28*28
 hidden_size = 500
 output_size = 10
-n_hidden = 2
+n_hidden = 10
 verbose = True
 accelerator = 'gpu'
 compile = True
+lr = 2e-2
 
 
-lambda_list = [1e-5]
-
+# lambda_list = [1e-3, 2.5e-3, 5e-3, 1e-2, 2.5e-2, 5e-2, 1e-1] # used for standard net
+# lambda_list = [1e-5, 2.5e-5, 5e-5, 1e-4, 2.5e-4, 5e-4, 1e-3] # used for all others
 
 #PSiLONNet
+lambda_list = [2.5e-4] # best
 model = NormResNet(input_size, hidden_size, output_size, 
                    n_hidden = n_hidden, share=True, use_bias=True, 
                    use_l2_wn=False, use_1pathnorm=True,
                    use_improved_1pathnorm = True)
-performance, nsparsity = get_NN_result(model, compute_loss, compute_eval,
-                                        train_loader, val_loader, test_loader,
+performance, ce, nsparsity = get_NN_result(model, compute_loss, compute_eval,
+                                        compute_test,
+                                        dl_train, dl_val, dl_test,
                                         lambda_list,
                                         verbose=verbose,
                                         compile=compile,
-                                        lr=1e-3)
+                                        lr=lr,
+                                        output_size=output_size,
+                                        accelerator=accelerator)
+
+
+# L1-IB
+lambda_list = [2.5e-4] # best
+model = NormResNet(input_size, hidden_size, output_size, 
+                   n_hidden = n_hidden, share=False, use_bias=True, 
+                   use_l2_wn=False, use_1pathnorm=True,
+                   use_improved_1pathnorm = True)
+performance, ce, nsparsity = get_NN_result(model, compute_loss, compute_eval,
+                                        compute_test,
+                                        dl_train, dl_val, dl_test,
+                                        lambda_list,
+                                        verbose=verbose,
+                                        compile=compile,
+                                        lr=lr,
+                                        output_size=output_size,
+                                        accelerator=accelerator)
+
+
+# L2-IB
+lambda_list = [2.5e-4] # best
+model = NormResNet(input_size, hidden_size, output_size, 
+                   n_hidden = n_hidden, share=False, use_bias=True, 
+                   use_l2_wn=True, use_1pathnorm=True,
+                   use_improved_1pathnorm = True)
+performance, ce, nsparsity = get_NN_result(model, compute_loss, compute_eval,
+                                        compute_test,
+                                        dl_train, dl_val, dl_test,
+                                        lambda_list,
+                                        verbose=verbose,
+                                        compile=compile,
+                                        lr=lr,
+                                        output_size=output_size,
+                                        accelerator=accelerator)
+
+# L1-OB
+lambda_list = [1e-4] # best
+model = NormResNet(input_size, hidden_size, output_size, 
+                   n_hidden = n_hidden, share=False, use_bias=True, 
+                   use_l2_wn=False, use_1pathnorm=True,
+                   use_improved_1pathnorm = False)
+performance, ce, nsparsity = get_NN_result(model, compute_loss, compute_eval,
+                                        compute_test,
+                                        dl_train, dl_val, dl_test,
+                                        lambda_list,
+                                        verbose=verbose,
+                                        compile=compile,
+                                        lr=lr,
+                                        output_size=output_size,
+                                        accelerator=accelerator)
+
+
+
+# L2-OB
+lambda_list = [1e-4] # best
+model = NormResNet(input_size, hidden_size, output_size, 
+                   n_hidden = n_hidden, share=False, use_bias=True, 
+                   use_l2_wn=True, use_1pathnorm=True,
+                   use_improved_1pathnorm = False)
+performance, ce, nsparsity = get_NN_result(model, compute_loss, compute_eval,
+                                        compute_test,
+                                        dl_train, dl_val, dl_test,
+                                        lambda_list,
+                                        verbose=verbose,
+                                        compile=compile,
+                                        lr=lr,
+                                        output_size=output_size,
+                                        accelerator=accelerator)
+
+
+
+# standard net
+lambda_list = [2.5e-2] # best
+model = NormResNet(input_size, hidden_size, output_size, 
+                   n_hidden = n_hidden, share=False, use_bias=True, 
+                   use_l2_wn=True, use_1pathnorm=False,
+                   use_improved_1pathnorm = False)
+performance, ce, nsparsity = get_NN_result(model, compute_loss, compute_eval,
+                                        compute_test,
+                                        dl_train, dl_val, dl_test,
+                                        lambda_list,
+                                        verbose=verbose,
+                                        compile=compile,
+                                        lr=lr,
+                                        output_size=output_size,
+                                        accelerator=accelerator)
+
+
+# Projected gradient descent PSiLON
+# to do this, at the start of the forward pass in CReLUNormLinear and NormLinear
+# temporarily add a step, where we perform the projection in a torch.no_grad() context:
+# you will get what you need from parameters using .data, manipulate it, and copy
+# it back to the parameter using .copy_ 
+# this will need to be performed within a new python session, since it will require
+# a recompile of the network, since we are using torch.jit
+lambda_list = [2.5e-4]
+model = NormResNet(input_size, hidden_size, output_size, 
+                   n_hidden = n_hidden, share=True, use_bias=True, 
+                   use_l2_wn=False, use_1pathnorm=True,
+                   use_improved_1pathnorm = True)
+performance, ce, nsparsity = get_NN_result(model, compute_loss, compute_eval,
+                                        compute_test,
+                                        dl_train, dl_val, dl_test,
+                                        lambda_list,
+                                        verbose=verbose,
+                                        compile=compile,
+                                        lr=lr,
+                                        output_size=output_size,
+                                        accelerator=accelerator)

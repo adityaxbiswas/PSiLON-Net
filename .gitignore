@@ -1,5 +1,6 @@
 openml_apikey.txt
 results.xlsx
+~$results.xlsx
 
 code/__pycache__/
 data/*

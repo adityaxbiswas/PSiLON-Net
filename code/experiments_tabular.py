@@ -50,7 +50,6 @@ from lightning.pytorch.callbacks.early_stopping import EarlyStopping
 import lightning as L
 import logging
 logging.getLogger("lightning.pytorch").setLevel(logging.ERROR)
-logging.getLogger("openml.tasks").setLevel(logging.ERROR)
 
 # import custom functions/classes
 from NN_utils import *
@@ -139,13 +138,6 @@ def get_NN_result(model, compute_loss, compute_eval,
     return performance, nsparsity
 ###################################################################################
 # smaller helper function/tools
-seed = 917325
-np.random.seed(seed)
-torch.manual_seed(seed)
-torch.cuda.manual_seed(seed)
-torch.backends.cudnn.deterministic = True
-torch.backends.cudnn.benchmark = False
-os.environ["PYTHONHASHSEED"] = str(seed)
 
 RMSE = lambda Y,Y_hat: np.sqrt(np.mean((Y-Y_hat)**2))
 def select_continuous_features(feature_names, categorical_indicator):
@@ -159,7 +151,8 @@ repeat_dataset_names = ['delays_zurich_transport', 'diamonds', 'Brazilian_houses
 
 ######################################################################################
 ### START SCRIPT
-
+n_keep = 20000
+train_size = 2000
 
 rf_performances = {}
 lr_performances = {}
@@ -169,44 +162,44 @@ psilon_nsparsities = {}
 standard_nsparsities = {}
 
 
-
-n_keep = 20000
+# Choose which of the 4 suites you want to run
 #SUITE_ID = 335 # Regression on numerical and categorical features
-#SUITE_ID = 336 # Regression on numerical features
+SUITE_ID = 336 # Regression on numerical features
 #SUITE_ID = 334 # Classification on numerical and categorical features
-SUITE_ID = 337 # Classification on numerical features
-classification = (SUITE_ID == 334) or (SUITE_ID == 337)
+#SUITE_ID = 337 # Classification on numerical features
 benchmark_suite = openml.study.get_suite(SUITE_ID)  # obtain the benchmark suite
+classification = (SUITE_ID == 334) or (SUITE_ID == 337)
+
+# Run the suite
 for task_id in benchmark_suite.tasks:  # iterate over all tasks
     # download/load the dataset
     task = openml.tasks.get_task(task_id)  # download the OpenML task
-    dataset = task.get_dataset()    
+    dataset = task.get_dataset()
+
+    # exclude certain datasets
     if (SUITE_ID == 336) or (SUITE_ID == 337):
         if dataset.name in repeat_dataset_names:
             continue
     if classification:
-        if dataset.name in ['pol', 'house_16H']:
+        if dataset.name in ['pol', 'house_16H']: # already regression datasets
             continue
-    if dataset.name != "Higgs":
-        continue
-
+    
+    # load data.  keep only if 10 or more predictors
     X, y, categorical_indicator, feature_names = dataset.get_data(
         dataset_format="dataframe", target=dataset.default_target_attribute
     )
     if len(X.columns) < 10:
         continue
-    print("Loaded dataset: " + dataset.name)
-    
-    # randomly reduce it in size and train/test split
     if y.dtype.name == "category":
         y = y.cat.codes.copy()
+    print("Loaded dataset: " + dataset.name)
+    
+    # randomly reduce data in size and train/test split
     n = min(len(y),n_keep)
-    shuffler = np.random.default_rng(seed=seed).permutation(len(y))
+    shuffler = np.random.permutation(len(y))
     X, y = X.iloc[shuffler,:], y.iloc[shuffler]
     X = X.iloc[:n,:]
     y = y.iloc[:n]
-
-    train_size = 2000
     X_train, X_test = X.iloc[:train_size,:], X.iloc[train_size:,:]
     y_train, y_test = y.iloc[:train_size], y.iloc[train_size:]
 
@@ -330,7 +323,7 @@ for task_id in benchmark_suite.tasks:  # iterate over all tasks
     dl_val = convert_to_dataloader(X_val, y_val.values)
     dl_test = convert_to_dataloader(X_test, y_test.values)
 
-    lambda_list = [1e-4, 2.5e-4, 5e-4, 1e-3, 2.5e-3, 5e-3, 
+    lambda_list = [5e-5, 1e-4, 2.5e-4, 5e-4, 1e-3, 2.5e-3, 5e-3, 
                    1e-2, 2.5e-2, 5e-2, 1e-1, 2.5e-1, 5e-1]
 
 
@@ -340,8 +333,8 @@ for task_id in benchmark_suite.tasks:  # iterate over all tasks
     performance, nsparsity = get_NN_result(model, compute_loss, compute_eval,
                                             dl_train, dl_val, dl_test,
                                             lambda_list,
-                                            verbose =  verbose, 
-                                            use_es = use_es,
+                                            verbose=verbose, 
+                                            use_es=use_es,
                                             compile=compile)
     psilon_performances[dataset.name] = performance
     psilon_nsparsities[dataset.name] = nsparsity
@@ -349,15 +342,14 @@ for task_id in benchmark_suite.tasks:  # iterate over all tasks
     print(f"Finished PSiLON Net Experiment: NS: {np.round(nsparsity, 3)}")
     
 
-    lambda_list=[1e-2]
     # StandardNet
     model = NormNet(X_train.shape[1], hidden_size, 1, n_hidden = n_hidden,
                 share=False, use_bias=True, use_l2_wn=True, use_1pathnorm=False)
     performance, nsparsity = get_NN_result(model, compute_loss, compute_eval,
                                             dl_train, dl_val, dl_test,
                                             lambda_list,
-                                            verbose = verbose, 
-                                            use_es = use_es,
+                                            verbose=verbose, 
+                                            use_es=use_es,
                                             compile=compile)
     standard_performances[dataset.name] = performance
     standard_nsparsities[dataset.name] = nsparsity
