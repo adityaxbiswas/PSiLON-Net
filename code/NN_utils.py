@@ -56,6 +56,7 @@ class LitNetwork(L.LightningModule):
         self.n_epochs = n_epochs
         self.lr = lr
         self.output_size = output_size
+        self.alpha = 0.5
 
     def forward(self, X):
         return self.model(X)
@@ -71,7 +72,8 @@ class LitNetwork(L.LightningModule):
         if self.output_size == 1:
             y_hat = y_hat[:,0]
         loss = self.compute_loss(y_hat, y)
-        loss_reg = loss + self.lambda_*self.model.compute_reg()
+        reg = self.lambda_*self.model.compute_reg()
+        loss_reg = (1-self.alpha)*loss + self.alpha*reg
         self.log('train_loss', loss, on_step=False, on_epoch=True)
         self.log('train_loss_reg', loss_reg, on_step=False, on_epoch=True)
         return loss_reg

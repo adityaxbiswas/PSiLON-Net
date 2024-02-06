@@ -26,6 +26,14 @@ import torchvision
 from torchvision import transforms
 import torch
 from torch.utils.data import DataLoader
+seed = 5392868
+torch.manual_seed(seed)
+#torch.use_deterministic_algorithms(True)
+import numpy as np
+np.random.seed(seed)
+import random
+random.seed(seed)
+
 import logging
 logging.getLogger("lightning.pytorch").setLevel(logging.ERROR)
 
@@ -60,7 +68,7 @@ def get_NN_result(model, compute_loss, compute_eval, compute_test,
         
         # define trainer
         mc_dir = path.join(checkpoint_folder, f"model-reg-{lambda_}")
-        check_val_every_n_epoch = 40
+        check_val_every_n_epoch = 5
         trainer = L.Trainer(callbacks=[], 
                             max_epochs = epochs,
                             accelerator=accelerator,
@@ -68,7 +76,7 @@ def get_NN_result(model, compute_loss, compute_eval, compute_test,
                             log_every_n_steps=5,
                             check_val_every_n_epoch = check_val_every_n_epoch,
                             enable_checkpointing=True,
-                            enable_progress_bar=False,
+                            enable_progress_bar=True,
                             enable_model_summary=False)
         
         # train, save model, predict, and record
@@ -122,10 +130,12 @@ data_test = torchvision.datasets.FashionMNIST(data_folder,
                                               transform=input_transform)
 
 # randomly subset into train/val
-data_train, data_val = torch.utils.data.random_split(data_train, [40000, 20000])
 n_keep_train = 10000
+n_keep_val = 20000
+data_train, data_val = torch.utils.data.random_split(data_train, [60000-n_keep_val,
+                                                                  n_keep_val])
 data_train, _ = torch.utils.data.random_split(data_train, [n_keep_train, 
-                                                           40000-n_keep_train])
+                                                           60000-n_keep_val-n_keep_train])
 
 
 # create data loaders
@@ -133,9 +143,9 @@ batch_size = 200
 n_batches = int(math.ceil(n_keep_train/batch_size))
 dl_train = DataLoader(data_train, batch_size=batch_size, shuffle=True,
                          num_workers=0, pin_memory=True)
-dl_val = DataLoader(data_val, batch_size=500,
+dl_val = DataLoader(data_val, batch_size=2000,
                          num_workers=0, pin_memory=True)
-dl_test = DataLoader(data_test, batch_size=500,
+dl_test = DataLoader(data_test, batch_size=2000,
                          num_workers=0)
 
 

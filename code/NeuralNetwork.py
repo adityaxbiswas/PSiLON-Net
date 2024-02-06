@@ -31,6 +31,8 @@ class NormLinear(nn.Module):
         # create and init parameters bias, g and weight
         if use_bias:
             self.bias = nn.Parameter(torch.zeros(1,output_size))
+        else:
+            self.bias = 0
         g_len = 1 if share else output_size
         self.g = nn.Parameter(torch.ones(1,g_len))
         self.weight = nn.Parameter(torch.empty(input_size, output_size))
@@ -254,6 +256,8 @@ class CReLUNormLinear(nn.Module):
         # create and init parameters bias, g, weight_pos, and weight_neg
         if use_bias:
             self.bias = nn.Parameter(torch.zeros(1,output_size))
+        else:
+            self.bias = 0
         g_len = 1 if share else output_size
         if init_zero:
             self.g = nn.Parameter(torch.zeros(1,g_len))
@@ -358,11 +362,11 @@ class CReLUNormLinear(nn.Module):
         return Z
 
 class NormResidualBlock(nn.Module):
-    def __init__(self, input_size, output_size, share=False, 
+    def __init__(self, input_size, share=False, 
                  use_bias=True, use_l2_wn=False, init_zero=False):
         super().__init__()
         self.use_bias = use_bias
-        self.linear = CReLUNormLinear(input_size, output_size, 
+        self.linear = CReLUNormLinear(input_size, input_size, 
                                       share=share, 
                                       use_bias=use_bias, 
                                       init_zero=init_zero,
@@ -374,6 +378,8 @@ class NormResidualBlock(nn.Module):
         return self.linear.get_sparsity(near)
     def forward(self, X):
         return X + self.linear(*self.activation(X))
+    
+
 
 class NormResNet(nn.Module):
     def __init__(self, input_size, hidden_size, output_size,  n_hidden = 1,
@@ -399,8 +405,7 @@ class NormResNet(nn.Module):
         self.embedder = NormLinear(input_size, hidden_size, 
                                    share=share, use_bias=use_bias,
                                     use_l2_wn=use_l2_wn)
-        self.representer = [NormResidualBlock(hidden_size, hidden_size,
-                                              share=share, use_bias=use_bias,
+        self.representer = [NormResidualBlock(hidden_size, share=share, use_bias=use_bias,
                                                 use_l2_wn=use_l2_wn, init_zero=True) \
                             for _ in range(n_hidden-1)]
         self.representer = nn.ModuleList(self.representer)
@@ -462,7 +467,7 @@ class NormResNet(nn.Module):
         W1 = self.embedder.get_normalized_weights()
         reg = torch.sum(torch.pow(W1,2))
         for module in self.representer:
-            Wi_pos, Wi_neg =  module.linear.get_normalized_weights()
+            Wi_pos, Wi_neg = module.linear.get_normalized_weights()
             reg = reg + torch.sum(torch.pow(Wi_pos,2)) + torch.sum(torch.pow(Wi_neg,2))
         WK_pos, WK_neg = self.predictor.get_normalized_weights()
         reg = reg + torch.sum(torch.pow(WK_pos,2)) + torch.sum(torch.pow(WK_neg,2))

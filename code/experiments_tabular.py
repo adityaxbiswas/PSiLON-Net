@@ -45,6 +45,8 @@ from sklearn.metrics import log_loss
 
 
 from torch import nn
+torch.manual_seed(91735)
+torch.use_deterministic_algorithms(True)
 from lightning.pytorch.callbacks import ModelCheckpoint
 from lightning.pytorch.callbacks.early_stopping import EarlyStopping
 import lightning as L
